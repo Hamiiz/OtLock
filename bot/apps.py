@@ -19,9 +19,8 @@ class BotConfig(AppConfig):
         If WEBHOOK_URL is set, registers the webhook with Telegram in a
         background daemon thread so startup is never blocked.
         """
-        # Django's StatReloader runs this twice — only act in the main process.
-        if os.environ.get("RUN_MAIN") != "true":
-            return
+        # Auto-register webhook with Telegram in a background thread
+        # (This is safe to call repeatedly on startup)
 
         webhook_url = os.environ.get("WEBHOOK_URL", "").strip().rstrip("/")
         token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
