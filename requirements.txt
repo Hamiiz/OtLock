@@ -1,5 +1,7 @@
 Django==4.2.11
-psycopg2-binary==2.9.9
-python-telegram-bot[job-queue]==20.8
+psycopg2-binary==2.9.10
+python-telegram-bot[job-queue]>=21.0
 python-dotenv==1.0.1
 dj-database-url==2.1.0
+gunicorn==21.2.0
+uvicorn==0.29.0

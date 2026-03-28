@@ -1,14 +1,16 @@
 # OT Signup Telegram Bot
 
-A Telegram bot for overtime (OT) signup built with **Django 4.2** + **PostgreSQL** + **python-telegram-bot v20**.
+A Telegram bot for overtime (OT) signup built with **Django 4.2** + **PostgreSQL** + **python-telegram-bot v21** + **uvicorn**.
+
+The bot runs on **webhook** mode by default — when `WEBHOOK_URL` is set in `.env`, it auto-registers with Telegram on startup. When `WEBHOOK_URL` is absent, use polling mode via `run_bot`.
 
 ---
 
 ## Quick Start
 
 ### 1. Prerequisites
-- Python 3.11+
-- PostgreSQL running locally (or any accessible Postgres server)
+- Python 3.13
+- A PostgreSQL database (e.g. [Supabase](https://supabase.com) free tier)
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - The bot must be added as an **admin** in your announcement group
 
@@ -33,8 +35,11 @@ Edit `.env` and fill in:
 | `GROUP_CHAT_ID` | Negative chat ID of the announcement group |
 | `DATABASE_URL` | PostgreSQL connection string |
 | `SECRET_KEY` | Django secret key |
+| `WEBHOOK_URL` | Public HTTPS base URL (no trailing slash). Leave blank for polling mode. |
 
-> **Tip:** To find your Group Chat ID, temporarily add `@userinfobot` to the group, or forward a group message to it.
+> **⚠️ Special characters in passwords:** If your database password contains `@` or `#`, URL-encode them in `DATABASE_URL`: `@` → `%40`, `#` → `%23`.
+
+> **Tip:** To find your Group Chat ID, forward a message from the group to [@userinfobot](https://t.me/userinfobot).
 
 ### 4. Set up the database
 
@@ -44,6 +49,25 @@ python manage.py createsuperuser   # optional: for Django admin UI
 ```
 
 ### 5. Run the bot
+
+#### Webhook mode (recommended for production and local dev)
+
+Open two terminals:
+
+```bash
+# Terminal 1 — start tunnel (ngrok recommended; avoids challenge pages)
+ngrok http 8000
+# Copy the https URL (e.g. https://xxxx.ngrok-free.app) into WEBHOOK_URL in .env
+
+# Terminal 2 — start the ASGI server (uvicorn required for async webhook)
+uvicorn tgbot.asgi:application --reload --port 8000
+```
+
+Telegram webhook is registered automatically on startup.
+
+#### Polling mode (offline / no tunnel)
+
+Remove or comment out `WEBHOOK_URL` in `.env`, then:
 
 ```bash
 python manage.py run_bot
@@ -58,7 +82,9 @@ python manage.py run_bot
 | Command | Description |
 |---|---|
 | `/newot` | Start creating a new OT event (guided wizard) |
-| `/closesignup` | Close the active OT event and review the signup list |
+| `/status` | Check the current signup list without closing the event |
+| `/remove` | Remove a specific agent from the signup list |
+| `/closesignup` | Close the active OT event and review the final signup list |
 | `/cancel` | Cancel the current wizard at any step |
 
 ### User Commands (private chat with the bot)
@@ -66,7 +92,8 @@ python manage.py run_bot
 | Command / Action | Description |
 |---|---|
 | `/start` | Begin the OT signup flow |
-| `/cancel` | Cancel and exit the signup flow |
+| `/myot` | View your confirmed signups for the active OT event |
+| `/cancel` | Cancel and exit the `/start` signup flow |
 
 ---
 
@@ -76,8 +103,9 @@ python manage.py run_bot
 /newot
   → Enter title/description
   → Select days (multi-select toggle)
-  → Set time slots per day (2h / 4h / custom)
+  → Set time slots per day (multi-select toggle: e.g. check both 2h and 4h)
        Saturday/Sunday: full shift (8h) + optional extra OT (+2h / +4h)
+       Custom hours can also be typed and added to the list of choices
   → Set max agents (or 0 for unlimited)
   → Bot posts announcement to group ✅
 ```
@@ -97,11 +125,11 @@ When signup is ready to close:
 ```
 Open bot in private → /start
   → Enter agent name (saved + linked to Telegram ID)
-  → Select OT day (buttons)
-  → Select hours (buttons)
-  → Select class type: Dialer / IB / Toplist
-  → Confirm (⚠️ cannot cancel after confirming)
-  → Signed up! 🎉
+  → Select OT days (multi-select toggle, e.g., Sat + Sun)
+  → Select hours per chosen day (loops through each selected day)
+  → Select class type: Dialer / IB / Toplist (applies to all signups)
+  → Review summary and confirm (⚠️ cannot cancel after confirming)
+  → Signed up for all selected days! 🎉
 ```
 
 **Returning users:** If you've used the bot before, your name is remembered — you go straight to day selection.
@@ -110,7 +138,7 @@ Open bot in private → /start
 
 ## Django Admin UI
 
-Access at `http://127.0.0.1:8000/admin/` after running `python manage.py runserver`.
+Access at `http://127.0.0.1:8000/admin/` while the server is running.
 
 Lets you inspect and manage all `OTEvent`, `Agent`, and `OTSignup` records.
 
@@ -119,18 +147,46 @@ Lets you inspect and manage all `OTEvent`, `Agent`, and `OTSignup` records.
 ## Project Structure
 
 ```
-tgbot/
+otlock/
 ├── manage.py
-├── .env.example
+├── .env                  ← local config (not committed)
+├── .env.example          ← config template
 ├── requirements.txt
-├── tgbot/               ← Django project
+├── Procfile              ← production: uvicorn tgbot.asgi:application
+├── runtime.txt           ← python-3.13.0
+├── tgbot/                ← Django project
 │   ├── settings.py
-│   └── urls.py
-└── bot/                 ← Django app
-    ├── models.py        ← OTEvent, Agent, OTSignup
-    ├── admin.py         ← Django admin config
-    ├── utils.py         ← Keyboards, message formatters
+│   ├── urls.py
+│   ├── asgi.py           ← ASGI entry point (uvicorn / production)
+│   └── wsgi.py           ← WSGI entry point (legacy)
+└── bot/                  ← Django app
+    ├── models.py         ← OTEvent, Agent, OTSignup
+    ├── admin.py          ← Django admin config
+    ├── apps.py           ← BotConfig: auto-registers webhook on startup
+    ├── bot_app.py        ← Singleton PTB Application factory
+    ├── views.py          ← Async webhook endpoint (/bot/webhook/)
+    ├── urls.py           ← URL routing
+    ├── utils.py          ← Keyboards, message formatters
     └── handlers/
         ├── admin_handlers.py   ← /newot, /closesignup, approve flow
         └── user_handlers.py    ← /start signup flow
 ```
+
+---
+
+## Deploying to Production
+
+Set the following environment variables on your platform (Railway, Render, Heroku, etc.):
+
+```
+SECRET_KEY=...
+DEBUG=False
+ALLOWED_HOSTS=yourdomain.com
+DATABASE_URL=postgresql://...
+TELEGRAM_BOT_TOKEN=...
+ADMIN_IDS=...
+GROUP_CHAT_ID=...
+WEBHOOK_URL=https://yourdomain.com
+```
+
+The `Procfile` runs `uvicorn tgbot.asgi:application` automatically.

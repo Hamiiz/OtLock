@@ -17,6 +17,10 @@ class OTEvent(models.Model):
     # Maximum number of agents allowed to sign up (null = unlimited)
     max_agents = models.PositiveIntegerField(null=True, blank=True)
     is_open = models.BooleanField(default=True)
+    deadline = models.DateTimeField(
+        null=True, blank=True,
+        help_text="Auto-close after this UTC datetime (null = no deadline)"
+    )
     # The group chat where the announcement was posted
     group_chat_id = models.BigIntegerField()
     # Message ID of the announcement so we can reference it later
@@ -69,11 +73,25 @@ class OTSignup(models.Model):
     confirmed_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        # One signup per agent per event
-        unique_together = [("agent", "ot_event")]
+        # One signup per agent per event per day (agents can sign up for multiple days)
+        unique_together = [("agent", "ot_event", "day")]
 
     def __str__(self):
         return (
             f"{self.agent.agent_name} → {self.ot_event.title} "
             f"({self.day}, {self.hours}h, {self.class_type})"
         )
+
+
+class AdminUser(models.Model):
+    """Dynamically added bot admin (supplements ADMIN_IDS env var)."""
+
+    telegram_id = models.BigIntegerField(unique=True)
+    telegram_username = models.CharField(max_length=255, blank=True)
+    telegram_name = models.CharField(max_length=255, blank=True)
+    added_by = models.BigIntegerField()   # Telegram ID of who added them
+    added_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        name = f"@{self.telegram_username}" if self.telegram_username else self.telegram_name
+        return f"Admin {name} ({self.telegram_id})"

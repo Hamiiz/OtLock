@@ -14,7 +14,7 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "insecure-dev-key-change-me")
 
 DEBUG = os.environ.get("DEBUG", "True") == "True"
 
-ALLOWED_HOSTS = ["*"]
+ALLOWED_HOSTS = os.environ.get("ALLOWED_HOSTS", "*").split(",")
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -23,7 +23,7 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-    "bot",
+    "bot.apps.BotConfig",
 ]
 
 MIDDLEWARE = [

@@ -8,14 +8,7 @@ import logging
 from django.core.management.base import BaseCommand
 from django.conf import settings
 
-from telegram.ext import Application, CallbackQueryHandler
-
-from bot.handlers.admin_handlers import (
-    build_admin_conversation,
-    close_signup,
-    approve_and_send,
-)
-from bot.handlers.user_handlers import build_user_conversation
+from bot.bot_app import get_ptb_application
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -39,22 +32,10 @@ class Command(BaseCommand):
 
         self.stdout.write(self.style.SUCCESS("🤖 Starting OT Signup Bot…"))
 
-        app = Application.builder().token(token).build()
-
-        # Register admin conversation (/newot flow)
-        app.add_handler(build_admin_conversation())
-
-        # Register user conversation (/start flow)
-        app.add_handler(build_user_conversation())
-
-        # Standalone command handlers (outside conversation)
-        from telegram.ext import CommandHandler
-        app.add_handler(CommandHandler("closesignup", close_signup))
-
-        # Inline button callbacks that live outside a conversation
-        app.add_handler(
-            CallbackQueryHandler(approve_and_send, pattern=r"^approve_list:")
-        )
-
+        app = get_ptb_application()
+        if not app:
+            self.stderr.write(self.style.ERROR("Failed to initialize bot application."))
+            return
+        
         self.stdout.write(self.style.SUCCESS("✅ Bot is running. Press Ctrl+C to stop."))
         app.run_polling(drop_pending_updates=True)
