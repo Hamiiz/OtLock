@@ -26,6 +26,7 @@ async def telegram_webhook(request):
         # Initialize once — safe to call repeatedly, PTB is idempotent here.
         if not app._initialized:
             await app.initialize()
+            await app.start()
 
         payload = json.loads(request.body.decode("utf-8"))
         update = Update.de_json(payload, app.bot)
