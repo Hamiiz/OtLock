@@ -59,7 +59,7 @@ WSGI_APPLICATION = "tgbot.wsgi.application"
 DATABASES = {
     "default": dj_database_url.config(
         default=os.environ.get("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/tgbot_db"),
-        conn_max_age=600,
+        conn_max_age=0,
     )
 }
 
