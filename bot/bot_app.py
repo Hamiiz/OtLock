@@ -38,7 +38,7 @@ def get_ptb_application():
             logger.error("TELEGRAM_BOT_TOKEN is not set.")
             return None
             
-        app = Application.builder().token(token).build()
+        app = Application.builder().token(token).concurrent_updates(False).build()
 
         # Register admin conversation (/newot flow)
         app.add_handler(build_admin_conversation())

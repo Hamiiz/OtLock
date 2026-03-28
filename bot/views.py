@@ -26,7 +26,6 @@ async def telegram_webhook(request):
         # Initialize once — safe to call repeatedly, PTB is idempotent here.
         if not app._initialized:
             await app.initialize()
-            await app.start()
 
         payload = json.loads(request.body.decode("utf-8"))
         update = Update.de_json(payload, app.bot)
@@ -34,5 +33,7 @@ async def telegram_webhook(request):
 
         return JsonResponse({"status": "ok"})
     except Exception as exc:
-        logger.error(f"Error handling webhook update: {exc}")
-        return JsonResponse({"status": "error"}, status=500)
+        import traceback
+        err_str = traceback.format_exc()
+        logger.error(f"Error handling webhook update:\n{err_str}")
+        return JsonResponse({"status": "error", "error": str(exc), "traceback": err_str}, status=500)
