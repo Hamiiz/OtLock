@@ -8,7 +8,6 @@ from bot.bot_app import get_ptb_application
 logger = logging.getLogger(__name__)
 
 
-@csrf_exempt
 async def telegram_webhook(request):
     """
     Async Django view — processes Telegram webhook updates.
@@ -37,3 +36,5 @@ async def telegram_webhook(request):
         err_str = traceback.format_exc()
         logger.error(f"Error handling webhook update:\n{err_str}")
         return JsonResponse({"status": "error", "error": str(exc), "traceback": err_str}, status=500)
+
+telegram_webhook.csrf_exempt = True
