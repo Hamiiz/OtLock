@@ -131,8 +131,8 @@ def format_announcement(event) -> str:
     slots_lines = []
     for day, slots in event.time_slots.items():
         slot_str = " / ".join(_hours_label(day, float(s)) for s in sorted(set(slots)))
-        slots_lines.append(f"  * {day}: {slot_str}")
-    slots_block = "\n".join(slots_lines) if slots_lines else "  * See admin for details"
+        slots_lines.append(f"  • {day}: {slot_str}")
+    slots_block = "\n".join(slots_lines) if slots_lines else "  • See admin for details"
     max_str = str(event.max_agents) if event.max_agents else "Unlimited"
     deadline_str = ""
     if event.deadline:
