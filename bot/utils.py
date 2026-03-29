@@ -6,6 +6,8 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import List
 
+from django.utils import timezone
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 
@@ -136,7 +138,8 @@ def format_announcement(event) -> str:
     max_str = str(event.max_agents) if event.max_agents else "Unlimited"
     deadline_str = ""
     if event.deadline:
-        deadline_str = f"\n*Signup closes:* {event.deadline.strftime('%d %b %Y %H:%M')} UTC"
+        local_dl = timezone.localtime(event.deadline)
+        deadline_str = f"\n*Signup closes:* {local_dl.strftime('%d %b %Y %H:%M')} EAT"
     return (
         f"*OT ANNOUNCEMENT*\n\n"
         f"*{_esc(event.title)}*\n\n"
