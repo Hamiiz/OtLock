@@ -99,7 +99,6 @@ def _create_event(title, telegram_id, days, time_slots, max_agents, deadline=Non
         time_slots=time_slots,
         max_agents=max_agents,
         deadline=deadline,
-        deadline=deadline,
         group_chat_id=settings.GROUP_CHAT_ID,
     )
 
