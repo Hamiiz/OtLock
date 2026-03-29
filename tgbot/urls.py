@@ -8,5 +8,6 @@ def health_check(request):
 urlpatterns = [
     path("", health_check),
     path("admin/", admin.site.urls),
+    path("", include("django.contrib.auth.urls")),
     path("bot/", include("bot.urls")),
 ]

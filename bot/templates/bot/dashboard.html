@@ -1,0 +1,94 @@
+{% extends 'bot/layout.html' %}
+{% load tz %}
+
+{% block title %}Dashboard - OT Management{% endblock %}
+
+{% block content %}
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem;">
+    <h2>Active OT Events</h2>
+    <a href="{% url 'ot-create' %}" class="btn">
+        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" style="width: 20px; height: 20px;">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path>
+        </svg>
+        Create New OT
+    </a>
+</div>
+
+{% if events %}
+    <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 1.5rem;">
+        {% for event in events %}
+        <div class="glass-card" style="display: flex; flex-direction: column;">
+            <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 1rem;">
+                <h3 style="margin: 0; color: var(--primary);">{{ event.title }}</h3>
+                <span style="background: rgba(16, 185, 129, 0.2); color: var(--secondary); padding: 0.2rem 0.6rem; border-radius: 99px; font-size: 0.8rem; font-weight: 600;">ACTIVE</span>
+            </div>
+            
+            <div style="color: var(--text-muted); font-size: 0.95rem; margin-bottom: 1.5rem; flex: 1;">
+                <p style="margin-bottom: 0.5rem;"><strong>Days:</strong> {{ event.days|join:", " }}</p>
+                <p style="margin-bottom: 0.5rem;"><strong>Signups:</strong> {{ event.signups.count }} / {% if event.max_agents %}{{ event.max_agents }}{% else %}Unlimited{% endif %}</p>
+                {% if event.deadline %}
+                    <p><strong>Deadline:</strong> {{ event.deadline|localtime|date:"d M Y H:i" }} EAT</p>
+                {% endif %}
+            </div>
+
+            <div style="display: flex; gap: 0.5rem; margin-top: auto;">
+                <a href="{% url 'ot-edit' event.pk %}" class="btn secondary" style="flex: 1; font-size: 0.9rem;">Edit</a>
+                <a href="{% url 'ot-detail' event.pk %}" class="btn secondary" style="flex: 1; font-size: 0.9rem;">View Signups</a>
+                <form method="post" action="{% url 'ot-close' event.pk %}" style="display: inline;" onsubmit="return confirm('Are you sure you want to close this OT event and remove the agents\' ability to sign up?');">
+                    {% csrf_token %}
+                    <button type="submit" class="btn danger" style="padding: 0.6rem; display: flex; align-items: center; justify-content: center;">
+                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" style="width: 20px; height: 20px;">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                        </svg>
+                    </button>
+                </form>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+{% else %}
+    <div class="glass-card text-center" style="padding: 4rem 2rem;">
+        <svg fill="none" stroke="var(--text-muted)" viewBox="0 0 24 24" style="width: 64px; height: 64px; margin: 0 auto 1.5rem auto; display: block; opacity: 0.5;">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
+        </svg>
+        <h3 style="color: var(--text-muted);">No Active OTs</h3>
+        <p style="color: rgba(148, 163, 184, 0.7); max-width: 400px; margin: 0 auto;">There are currently no open OT signup events. Click the button above to broadcast a new schedule to your agents.</p>
+    </div>
+{% endif %}
+
+<div style="margin-top: 4rem;">
+    <h3 style="margin-bottom: 1.5rem; color: var(--text-muted);">Recent History</h3>
+    {% if past_events %}
+    <div class="glass-card" style="padding: 0;">
+        <div style="overflow-x: auto;">
+            <table style="width: 100%; border-collapse: collapse; text-align: left;">
+                <thead>
+                    <tr style="border-bottom: 1px solid var(--glass-border);">
+                        <th style="padding: 1rem 1.5rem; font-weight: 600; color: var(--text-muted);">Title</th>
+                        <th style="padding: 1rem 1.5rem; font-weight: 600; color: var(--text-muted);">Days</th>
+                        <th style="padding: 1rem 1.5rem; font-weight: 600; color: var(--text-muted);">Signups</th>
+                        <th style="padding: 1rem 1.5rem; font-weight: 600; color: var(--text-muted);">Closed On</th>
+                        <th style="padding: 1rem 1.5rem; font-weight: 600; color: var(--text-muted);">Action</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for event in past_events %}
+                    <tr style="border-bottom: 1px solid var(--glass-border); transition: background 0.2s;">
+                        <td style="padding: 1rem 1.5rem; font-weight: 500;">{{ event.title }}</td>
+                        <td style="padding: 1rem 1.5rem; color: var(--text-muted);">{{ event.days|join:", " }}</td>
+                        <td style="padding: 1rem 1.5rem;">{{ event.signups.count }}</td>
+                        <td style="padding: 1rem 1.5rem; color: var(--text-muted);">{{ event.created_at|date:"d M Y" }}</td>
+                        <td style="padding: 1rem 1.5rem;">
+                            <a href="{% url 'ot-detail' event.pk %}" class="btn secondary" style="padding: 0.4rem 0.8rem; font-size: 0.8rem;">View List</a>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% else %}
+    <p style="color: var(--text-muted); font-style: italic;">No past events found.</p>
+    {% endif %}
+</div>
+{% endblock %}

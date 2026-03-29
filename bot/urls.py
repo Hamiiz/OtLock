@@ -3,4 +3,9 @@ from . import views
 
 urlpatterns = [
     path("webhook/", views.telegram_webhook, name="telegram_webhook"),
+    path("dashboard/", views.dashboard_view, name="dashboard"),
+    path("dashboard/create/", views.ot_create_view, name="ot-create"),
+    path("dashboard/<int:pk>/edit/", views.ot_edit_view, name="ot-edit"),
+    path("dashboard/<int:pk>/close/", views.ot_close_view, name="ot-close"),
+    path("dashboard/<int:pk>/signups/", views.ot_detail_view, name="ot-detail"),
 ]

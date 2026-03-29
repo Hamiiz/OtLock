@@ -1,0 +1,72 @@
+{% extends 'bot/layout.html' %}
+{% load tz %}
+
+{% block title %}Signups - {{ event.title }}{% endblock %}
+
+{% block content %}
+<div class="glass-card mb-2" style="display: flex; justify-content: space-between; align-items: flex-start;">
+    <div>
+        <div style="display: flex; align-items: center; gap: 1rem; margin-bottom: 0.5rem;">
+            <h2 style="margin: 0;">{{ event.title }}</h2>
+            {% if event.is_open %}
+                <span style="background: rgba(16, 185, 129, 0.2); color: var(--secondary); padding: 0.2rem 0.6rem; border-radius: 99px; font-size: 0.8rem; font-weight: 600;">ACTIVE</span>
+            {% else %}
+                <span style="background: rgba(148, 163, 184, 0.2); color: var(--text-muted); padding: 0.2rem 0.6rem; border-radius: 99px; font-size: 0.8rem; font-weight: 600;">CLOSED</span>
+            {% endif %}
+        </div>
+        <p style="color: var(--text-muted);"><strong>Days:</strong> {{ event.days|join:", " }}</p>
+    </div>
+    
+    <div style="display: flex; gap: 0.5rem;">
+        <a href="{% url 'dashboard' %}" class="btn secondary">Back to Dashboard</a>
+        {% if event.is_open %}
+            <form method="post" action="{% url 'ot-close' event.pk %}" style="display: inline;" onsubmit="return confirm('Close signups immediately?');">
+                {% csrf_token %}
+                <button type="submit" class="btn danger">Force Close</button>
+            </form>
+        {% endif %}
+    </div>
+</div>
+
+<div class="glass-card" style="padding: 0;">
+    <div style="padding: 1.5rem; border-bottom: 1px solid var(--glass-border); display: flex; justify-content: space-between; align-items: center;">
+        <h3 style="margin: 0;">Agent Signups ({{ event.signups.count }})</h3>
+    </div>
+    
+    {% if event.signups.exists %}
+    <div style="overflow-x: auto;">
+        <table style="width: 100%; border-collapse: collapse; text-align: left;">
+            <thead>
+                <tr style="border-bottom: 1px solid var(--glass-border); background: rgba(15, 23, 42, 0.3);">
+                    <th style="padding: 1rem 1.5rem; font-weight: 600; color: var(--text-muted);">Day</th>
+                    <th style="padding: 1rem 1.5rem; font-weight: 600; color: var(--text-muted);">Agent</th>
+                    <th style="padding: 1rem 1.5rem; font-weight: 600; color: var(--text-muted);">Department</th>
+                    <th style="padding: 1rem 1.5rem; font-weight: 600; color: var(--text-muted);">Slot</th>
+                    <th style="padding: 1rem 1.5rem; font-weight: 600; color: var(--text-muted);">Signed Up (EAT)</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for signup in event.signups.all %}
+                <tr style="border-bottom: 1px solid var(--glass-border); transition: background 0.2s;">
+                    <td style="padding: 1rem 1.5rem; font-weight: 600; color: var(--primary);">{{ signup.day }}</td>
+                    <td style="padding: 1rem 1.5rem;">
+                        <span style="font-weight: 500;">{{ signup.agent.display_name }}</span>
+                        <div style="font-size: 0.8rem; color: var(--text-muted);">ID: {{ signup.agent.telegram_id }}</div>
+                    </td>
+                    <td style="padding: 1rem 1.5rem;">
+                        <span style="background: rgba(255, 255, 255, 0.1); padding: 0.2rem 0.6rem; border-radius: 4px; font-size: 0.85rem;">{{ signup.class_type }}</span>
+                    </td>
+                    <td style="padding: 1rem 1.5rem;">{{ signup.slot_hours|floatformat:1 }} hours</td>
+                    <td style="padding: 1rem 1.5rem; color: var(--text-muted); font-size: 0.9rem;">{{ signup.confirmed_at|localtime|date:"d M H:i" }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="text-center" style="padding: 4rem 2rem;">
+        <p style="color: var(--text-muted); font-size: 1.1rem;">No agents have signed up for this OT event yet.</p>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

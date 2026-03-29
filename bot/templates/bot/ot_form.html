@@ -1,0 +1,65 @@
+{% extends 'bot/layout.html' %}
+
+{% block title %}Create OT Event - OT Dashboard{% endblock %}
+
+{% block content %}
+<div style="max-width: 600px; margin: 0 auto;">
+    <div class="glass-card">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem;">
+            <h2>Create New OT Event</h2>
+            <a href="{% url 'dashboard' %}" class="btn secondary" style="padding: 0.4rem 0.8rem;">Cancel</a>
+        </div>
+
+        <form method="post" action="{% url 'ot-create' %}">
+            {% csrf_token %}
+            
+            <div class="form-group mb-2">
+                <label class="form-label" for="id_title">Event Title / Description</label>
+                <input type="text" name="title" class="form-control" id="id_title" placeholder="e.g. Weekend Push OT" required>
+            </div>
+
+            <div class="form-group mb-2">
+                <label class="form-label">Select Available Days</label>
+                {% if available_days %}
+                    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.5rem; margin-top: 0.5rem;">
+                        {% for day in available_days %}
+                            <label style="display: flex; align-items: center; gap: 0.5rem; background: rgba(15, 23, 42, 0.4); border: 1px solid var(--glass-border); padding: 0.8rem; border-radius: 8px; cursor: pointer; transition: all 0.2s;" onmouseover="this.style.background='rgba(59, 130, 246, 0.1)'" onmouseout="this.style.background='rgba(15, 23, 42, 0.4)'">
+                                <input type="checkbox" name="days" value="{{ day }}" style="accent-color: var(--primary); width: 1.2rem; height: 1.2rem;">
+                                <span style="font-weight: 500;">{{ day }}</span>
+                            </label>
+                        {% endfor %}
+                    </div>
+                {% else %}
+                    <div style="padding: 1rem; background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.2); border-radius: 8px; color: var(--danger);">
+                        All days are currently booked in active events. Please close them first.
+                    </div>
+                {% endif %}
+            </div>
+
+            <div style="display: flex; gap: 1rem; margin-bottom: 2rem;">
+                <div class="form-group" style="flex: 1; margin-bottom: 0;">
+                    <label class="form-label" for="id_max_agents">Max Signups <span style="font-weight: 400; font-size: 0.85rem">(Optional)</span></label>
+                    <input type="number" name="max_agents" class="form-control" id="id_max_agents" placeholder="Leave blank for unlimited" min="1">
+                </div>
+                
+                <div class="form-group" style="flex: 1; margin-bottom: 0;">
+                    <label class="form-label" for="id_deadline">Close Deadline <span style="font-weight: 400; font-size: 0.85rem">(Optional)</span></label>
+                    <input type="datetime-local" name="deadline" class="form-control" id="id_deadline" style="color-scheme: dark;">
+                </div>
+            </div>
+
+            {% if available_days %}
+                <button type="submit" class="btn" style="width: 100%; padding: 1rem; font-size: 1.1rem; justify-content: center;">
+                    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" style="width: 20px; height: 20px;">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path>
+                    </svg>
+                    Publish to Telegram
+                </button>
+                <div class="text-center mt-1" style="font-size: 0.85rem; color: var(--text-muted);">
+                    This will instantly send an announcement to the group chat.
+                </div>
+            {% endif %}
+        </form>
+    </div>
+</div>
+{% endblock %}

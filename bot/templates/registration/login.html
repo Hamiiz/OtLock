@@ -1,0 +1,31 @@
+{% extends 'bot/layout.html' %}
+
+{% block title %}Log In - OT Dashboard{% endblock %}
+
+{% block content %}
+<div style="max-width: 400px; margin: 4rem auto;">
+    <div class="glass-card">
+        <h2 class="text-center mb-2">Admin Login</h2>
+        <form method="post" action="{% url 'login' %}">
+            {% csrf_token %}
+            <div class="form-group">
+                <label class="form-label" for="id_username">Username</label>
+                <input type="text" name="username" class="form-control" autofocus required id="id_username">
+            </div>
+            
+            <div class="form-group mb-2">
+                <label class="form-label" for="id_password">Password</label>
+                <input type="password" name="password" class="form-control" required id="id_password">
+            </div>
+            
+            <button type="submit" class="btn" style="width: 100%">Secure Login</button>
+            <input type="hidden" name="next" value="{{ next }}">
+        </form>
+        {% if form.errors %}
+            <div class="mt-1" style="color: var(--danger); font-size: 0.9rem; text-align: center;">
+                Invalid username or password.
+            </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

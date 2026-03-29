@@ -56,6 +56,10 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "tgbot.wsgi.application"
 
+LOGIN_URL = 'login'
+LOGIN_REDIRECT_URL = 'dashboard'
+LOGOUT_REDIRECT_URL = 'login'
+
 DATABASES = {
     "default": dj_database_url.config(
         default=os.environ.get("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/tgbot_db"),
