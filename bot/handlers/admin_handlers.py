@@ -99,8 +99,25 @@ def _create_event(title, telegram_id, days, time_slots, max_agents, deadline=Non
         time_slots=time_slots,
         max_agents=max_agents,
         deadline=deadline,
+        deadline=deadline,
         group_chat_id=settings.GROUP_CHAT_ID,
     )
+
+
+@sync_to_async
+def _update_event(event_id, title, days, time_slots, max_agents, deadline):
+    """Updates an existing OTEvent and cascade deletes any signups spanning removed days."""
+    event = OTEvent.objects.get(pk=event_id)
+    event.title = title
+    event.days = days
+    event.time_slots = time_slots
+    event.max_agents = max_agents
+    event.deadline = deadline
+    event.save()
+    
+    # Remove any signups for days that were just removed
+    OTSignup.objects.filter(ot_event=event).exclude(day__in=days).delete()
+    return event
 
 
 @sync_to_async
@@ -217,6 +234,40 @@ async def newot_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
     )
     return ASK_TITLE
+
+
+@admin_only
+async def editot_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin triggers /editot to modify an active event's days and slots without cancelling it."""
+    open_events = await _get_open_events()
+    if not open_events:
+        await update.message.reply_text("There are no active OT events to edit right now.")
+        return ConversationHandler.END
+
+    event = open_events[0]
+    
+    context.user_data.clear()
+    context.user_data["edit_event_id"] = event.id
+    context.user_data["title"] = event.title
+    context.user_data["selected_days"] = list(event.days)
+    context.user_data["time_slots"] = event.time_slots if isinstance(event.time_slots, dict) else dict(event.time_slots)
+    context.user_data["max_agents"] = event.max_agents
+    
+    booked = await _get_booked_days()
+    for day in event.days:
+        booked.discard(day)
+    
+    from bot.utils import ALL_DAYS
+    available = [d for d in ALL_DAYS if d not in booked]
+    context.user_data["available_days"] = available
+    
+    await update.message.reply_text(
+        f"Editing OT Event: *{_esc(event.title)}*\n"
+        "Select the days for this OT event.\nTap a day to toggle it, then press Done.",
+        reply_markup=days_keyboard(context.user_data["selected_days"], available),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return ASK_DAYS
 
 
 async def receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -415,25 +466,50 @@ async def receive_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if day not in time_slots:
             time_slots[day] = [8.0] if day in WEEKEND_DAYS else [2.0, 4.0]
 
-    event = await _create_event(title, uid, days, time_slots, max_agents, deadline)
-    announcement = format_announcement(event)
+    edit_event_id = context.user_data.get("edit_event_id")
+    if edit_event_id:
+        event = await _update_event(edit_event_id, title, days, time_slots, max_agents, deadline)
+        announcement = format_announcement(event)
+        if getattr(event, 'announcement_message_id', None):
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=settings.GROUP_CHAT_ID,
+                    message_id=event.announcement_message_id,
+                    text=announcement,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass  # Message might be completely identical or deleted by an admin manually
+                
+        max_str = str(max_agents) if max_agents else "Unlimited"
+        deadline_str = f", closes in {text}h" if deadline else ""
+        await update.message.reply_text(
+            f"OT Event *{_esc(title)}* updated successfully!\n"
+            f"Days: {', '.join(days)}\n"
+            f"Max: {max_str}{deadline_str}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        event = await _create_event(title, uid, days, time_slots, max_agents, deadline)
+        announcement = format_announcement(event)
 
-    msg = await context.bot.send_message(
-        chat_id=settings.GROUP_CHAT_ID,
-        text=announcement,
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    await _save_message_id(event, msg.message_id)
+        msg = await context.bot.send_message(
+            chat_id=settings.GROUP_CHAT_ID,
+            text=announcement,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await _save_message_id(event, msg.message_id)
 
-    max_str = str(max_agents) if max_agents else "Unlimited"
-    deadline_str = f", closes in {text}h" if deadline else ""
-    await update.message.reply_text(
-        f"OT Event *{_esc(title)}* published!\n"
-        f"Days: {', '.join(days)}\n"
-        f"Max: {max_str}{deadline_str}\n\n"
-        f"Use /closesignup to close manually, or it will auto-close at the deadline.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+        max_str = str(max_agents) if max_agents else "Unlimited"
+        deadline_str = f", closes in {text}h" if deadline else ""
+        await update.message.reply_text(
+            f"OT Event *{_esc(title)}* published!\n"
+            f"Days: {', '.join(days)}\n"
+            f"Max: {max_str}{deadline_str}\n\n"
+            f"Use /closesignup to close manually, or it will auto-close at the deadline.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -966,7 +1042,10 @@ async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def build_admin_conversation() -> ConversationHandler:
     return ConversationHandler(
-        entry_points=[CommandHandler("newot", newot_start)],
+        entry_points=[
+            CommandHandler("newot", newot_start),
+            CommandHandler("editot", editot_start),
+        ],
         states={
             ASK_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_title)],
             ASK_DAYS: [
