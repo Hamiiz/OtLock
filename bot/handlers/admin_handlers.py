@@ -59,14 +59,6 @@ def admin_keyboard():
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-@admin_only
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sends the persistent custom keyboard to the admin."""
-    await update.message.reply_text(
-        "Welcome to the Admin Panel! Choose an action below:",
-        reply_markup=admin_keyboard()
-    )
-
 # ── Conversation states ──────────────────────────────────────────────────────
 ASK_TITLE = 0
 ASK_DAYS = 1
@@ -108,6 +100,15 @@ def admin_only(func):
             return ConversationHandler.END
         return await func(update, context)
     return wrapper
+
+
+@admin_only
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends the persistent custom keyboard to the admin."""
+    await update.message.reply_text(
+        "Welcome to the Admin Panel! Choose an action below:",
+        reply_markup=admin_keyboard()
+    )
 
 
 @sync_to_async
