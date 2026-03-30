@@ -145,8 +145,7 @@ def format_announcement(event) -> str:
         f"*{_esc(event.title)}*\n\n"
         f"*Available Days:*\n  {days_str}\n\n"
         f"*Time Slots:*\n{slots_block}\n\n"
-        f"*Max Sign-ups:* {max_str}{deadline_str}\n\n"
-        f"To sign up: open the bot in private chat and follow the prompts!"
+        f"*Max Sign-ups:* {max_str}{deadline_str}"
     )
 
 

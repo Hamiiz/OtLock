@@ -487,9 +487,14 @@ async def receive_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
             time_slots[day] = [8.0] if day in WEEKEND_DAYS else [2.0, 4.0]
 
     edit_event_id = context.user_data.get("edit_event_id")
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     if edit_event_id:
         event = await _update_event(edit_event_id, title, days, time_slots, max_agents, deadline)
         announcement = format_announcement(event)
+        
+        keyboard = [[InlineKeyboardButton("🚀 Tap here to Sign Up", url=f"https://t.me/{context.bot.username}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
         if getattr(event, 'announcement_message_id', None):
             try:
                 await context.bot.edit_message_text(
@@ -497,6 +502,7 @@ async def receive_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     message_id=event.announcement_message_id,
                     text=announcement,
                     parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=reply_markup,
                 )
             except Exception:
                 pass  # Message might be completely identical or deleted by an admin manually
@@ -513,10 +519,15 @@ async def receive_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
         event = await _create_event(title, uid, days, time_slots, max_agents, deadline)
         announcement = format_announcement(event)
 
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        keyboard = [[InlineKeyboardButton("🚀 Tap here to Sign Up", url=f"https://t.me/{context.bot.username}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
         msg = await context.bot.send_message(
             chat_id=settings.GROUP_CHAT_ID,
             text=announcement,
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=reply_markup,
         )
         await _save_message_id(event, msg.message_id)
 
@@ -596,10 +607,12 @@ async def cancel_event_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         # Try to edit the group announcement to mark as cancelled
         if ann_msg_id:
             try:
+                from telegram import InlineKeyboardMarkup
                 await context.bot.edit_message_text(
                     chat_id=ann_chat_id,
                     message_id=ann_msg_id,
                     text="CANCELLED\n\n(This OT event has been cancelled by an admin.)",
+                    reply_markup=InlineKeyboardMarkup([[]])
                 )
             except Exception:
                 pass

@@ -70,6 +70,8 @@ def get_ptb_application():
         
         # User commands and existing specific commands
         app.add_handler(CommandHandler("myot", my_ot))
+        app.add_handler(MessageHandler(filters.Regex("^📅 My OTs$"), my_ot))
+        
         app.add_handler(CommandHandler("addadmin", add_admin_cmd))
         app.add_handler(CommandHandler("removeadmin", remove_admin_start))
         app.add_handler(CommandHandler("listadmins", list_admins))

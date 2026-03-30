@@ -119,20 +119,37 @@ def ot_create_view(request):
             group_chat_id=settings.GROUP_CHAT_ID,
         )
         
-        # Fire Telegram broadcast synchronously
+        # Fire Telegram broadcast synchronously using strict urllib request
         announcement = format_announcement(event)
         try:
-            bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
-            async def _send():
-                msg = await bot.send_message(
-                    chat_id=settings.GROUP_CHAT_ID,
-                    text=announcement,
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-                event.announcement_message_id = msg.message_id
+            import json
+            import urllib.request
+            
+            me_req = urllib.request.Request(f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/getMe")
+            me_res = json.loads(urllib.request.urlopen(me_req).read())
+            bot_username = me_res["result"]["username"]
+            
+            keyboard = {
+                "inline_keyboard": [
+                    [{"text": "🚀 Tap here to Sign Up", "url": f"https://t.me/{bot_username}"}]
+                ]
+            }
+
+            url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
+            req = urllib.request.Request(url, method="POST")
+            req.add_header('Content-Type', 'application/json')
+            data = json.dumps({
+                "chat_id": settings.GROUP_CHAT_ID,
+                "text": announcement,
+                "parse_mode": "Markdown",
+                "reply_markup": keyboard
+            })
+            response = urllib.request.urlopen(req, data=data.encode('utf-8'))
+            res_data = json.loads(response.read())
+            if res_data.get("ok"):
+                event.announcement_message_id = res_data["result"]["message_id"]
                 event.save()
             
-            async_to_sync(_send)()
             messages.success(request, f"OT '{title}' published successfully to Telegram!")
         except Exception as e:
             logger.error(f"Broadcast failed: {e}")
@@ -173,16 +190,20 @@ def ot_close_view(request, pk):
         
         # Broadcast the closure to Telegram dynamically updating the message
         try:
-            bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+            import json
+            import urllib.request
             announcement = format_announcement(event)
-            async def _update():
-                await bot.edit_message_text(
-                    chat_id=event.group_chat_id,
-                    message_id=event.announcement_message_id,
-                    text=announcement,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            async_to_sync(_update)()
+            url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/editMessageText"
+            req = urllib.request.Request(url, method="POST")
+            req.add_header('Content-Type', 'application/json')
+            data = json.dumps({
+                "chat_id": event.group_chat_id,
+                "message_id": event.announcement_message_id,
+                "text": announcement,
+                "parse_mode": "Markdown",
+                "reply_markup": {"inline_keyboard": []}
+            })
+            urllib.request.urlopen(req, data=data.encode('utf-8'))
         except Exception as e:
             logger.error(f"Failed to update pinned message upon closing: {e}")
 
