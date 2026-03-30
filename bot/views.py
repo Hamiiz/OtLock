@@ -12,7 +12,7 @@ from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.views.decorators.csrf import csrf_exempt
 
-from telegram import Update
+from telegram import Update, Bot
 from telegram.constants import ParseMode
 
 from bot.bot_app import get_ptb_application
@@ -95,12 +95,19 @@ def ot_create_view(request):
                 messages.error(request, "Invalid deadline format.")
                 return redirect("ot-create")
                 
-        # Time slots logic: simple default slots for the dashboard right now
-        # We can make it advanced later, but for V1 we assign standard slots.
-        from bot.utils import WEEKEND_DAYS
+        # Time slots logic: Custom hours from form
         time_slots = {}
         for day in days:
-            time_slots[day] = [8.0] if day in WEEKEND_DAYS else [2.0, 4.0]
+            raw_slots = request.POST.get(f"slots_{day}", "").strip()
+            if raw_slots:
+                try:
+                    slot_list = [float(s.strip()) for s in raw_slots.split(",") if s.strip()]
+                    time_slots[day] = slot_list if slot_list else [8.0]
+                except ValueError:
+                    time_slots[day] = [8.0]
+            else:
+                from bot.utils import WEEKEND_DAYS
+                time_slots[day] = [8.0] if day in WEEKEND_DAYS else [2.0, 4.0]
             
         event = OTEvent.objects.create(
             title=title,
@@ -113,11 +120,11 @@ def ot_create_view(request):
         )
         
         # Fire Telegram broadcast synchronously
-        app = get_ptb_application()
-        if app and app._initialized:
-            announcement = format_announcement(event)
+        announcement = format_announcement(event)
+        try:
+            bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
             async def _send():
-                msg = await app.bot.send_message(
+                msg = await bot.send_message(
                     chat_id=settings.GROUP_CHAT_ID,
                     text=announcement,
                     parse_mode=ParseMode.MARKDOWN,
@@ -125,11 +132,11 @@ def ot_create_view(request):
                 event.announcement_message_id = msg.message_id
                 event.save()
             
-            try:
-                async_to_sync(_send)()
-                messages.success(request, f"OT '{title}' published successfully to Telegram!")
-            except Exception as e:
-                messages.error(request, f"Saved OT but failed to broadcast to Telegram: {e}")
+            async_to_sync(_send)()
+            messages.success(request, f"OT '{title}' published successfully to Telegram!")
+        except Exception as e:
+            logger.error(f"Broadcast failed: {e}")
+            messages.error(request, f"Saved OT but failed to broadcast to Telegram. Please check logs.")
         
         return redirect("dashboard")
         
@@ -163,7 +170,23 @@ def ot_close_view(request, pk):
         event = get_object_or_404(OTEvent, pk=pk)
         event.is_open = False
         event.save()
-        messages.success(request, f"OT Event '{event.title}' is now closed.")
+        
+        # Broadcast the closure to Telegram dynamically updating the message
+        try:
+            bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+            announcement = format_announcement(event)
+            async def _update():
+                await bot.edit_message_text(
+                    chat_id=event.group_chat_id,
+                    message_id=event.announcement_message_id,
+                    text=announcement,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            async_to_sync(_update)()
+        except Exception as e:
+            logger.error(f"Failed to update pinned message upon closing: {e}")
+
+        messages.success(request, f"OT Event '{event.title}' is now closed and announcement updated.")
     return redirect("dashboard")
 
 

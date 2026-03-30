@@ -46,6 +46,26 @@ from bot.utils import (
     approve_list_keyboard,
     _esc,
 )
+from telegram import ReplyKeyboardMarkup
+
+# ── Custom Admin Keyboard ────────────────────────────────────────────────────
+def admin_keyboard():
+    keyboard = [
+        ["➕ New OT", "📝 Edit OT"],
+        ["📊 Status", "📈 Summary"],
+        ["📥 Export Signups", "🚪 Close Signups"],
+        ["❌ Remove Agent", "🗑️ Cancel OT"],
+        ["👥 Manage Admins"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+@admin_only
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends the persistent custom keyboard to the admin."""
+    await update.message.reply_text(
+        "Welcome to the Admin Panel! Choose an action below:",
+        reply_markup=admin_keyboard()
+    )
 
 # ── Conversation states ──────────────────────────────────────────────────────
 ASK_TITLE = 0
@@ -1043,7 +1063,9 @@ def build_admin_conversation() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[
             CommandHandler("newot", newot_start),
+            MessageHandler(filters.Regex("^➕ New OT$"), newot_start),
             CommandHandler("editot", editot_start),
+            MessageHandler(filters.Regex("^📝 Edit OT$"), editot_start),
         ],
         states={
             ASK_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_title)],

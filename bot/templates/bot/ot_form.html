@@ -23,10 +23,15 @@
                 {% if available_days %}
                     <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.5rem; margin-top: 0.5rem;">
                         {% for day in available_days %}
-                            <label style="display: flex; align-items: center; gap: 0.5rem; background: rgba(15, 23, 42, 0.4); border: 1px solid var(--glass-border); padding: 0.8rem; border-radius: 8px; cursor: pointer; transition: all 0.2s;" onmouseover="this.style.background='rgba(59, 130, 246, 0.1)'" onmouseout="this.style.background='rgba(15, 23, 42, 0.4)'">
-                                <input type="checkbox" name="days" value="{{ day }}" style="accent-color: var(--primary); width: 1.2rem; height: 1.2rem;">
-                                <span style="font-weight: 500;">{{ day }}</span>
-                            </label>
+                            <div style="background: rgba(15, 23, 42, 0.4); border: 1px solid var(--glass-border); padding: 0.8rem; border-radius: 8px; transition: all 0.2s;" onmouseover="this.style.background='rgba(59, 130, 246, 0.1)'" onmouseout="this.style.background='rgba(15, 23, 42, 0.4)'">
+                                <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer; margin-bottom: 0.5rem;">
+                                    <input type="checkbox" name="days" value="{{ day }}" style="accent-color: var(--primary); width: 1.2rem; height: 1.2rem;" onchange="document.getElementById('slots-{{ day }}').style.display = this.checked ? 'block' : 'none'">
+                                    <span style="font-weight: 500;">{{ day }}</span>
+                                </label>
+                                <div id="slots-{{ day }}" style="display: none; padding-left: 1.7rem;">
+                                    <input type="text" name="slots_{{ day }}" class="form-control" style="padding: 0.4rem; font-size: 0.85rem;" placeholder="e.g. 2, 4 (hours)">
+                                </div>
+                            </div>
                         {% endfor %}
                     </div>
                 {% else %}
