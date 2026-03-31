@@ -95,12 +95,21 @@ def ot_create_view(request):
                 messages.error(request, "Invalid deadline format.")
                 return redirect("ot-create")
                 
-        # Time slots logic: simple default slots for the dashboard right now
-        # We can make it advanced later, but for V1 we assign standard slots.
+        # Time slots logic: User selection via form checkboxes
+        weekday_slots_str = request.POST.getlist("weekday_slots")
+        weekend_slots_str = request.POST.getlist("weekend_slots")
+        
+        # Fallback to defaults if they unchecked everything
+        weekday_slots = [float(s) for s in weekday_slots_str] if weekday_slots_str else [2.0, 4.0]
+        weekend_slots = [float(s) for s in weekend_slots_str] if weekend_slots_str else [8.0, 10.0, 12.0]
+
         from bot.utils import WEEKEND_DAYS
         time_slots = {}
         for day in days:
-            time_slots[day] = [8.0] if day in WEEKEND_DAYS else [2.0, 4.0]
+            if day in WEEKEND_DAYS:
+                time_slots[day] = weekend_slots.copy()
+            else:
+                time_slots[day] = weekday_slots.copy()
             
         event = OTEvent.objects.create(
             title=title,
@@ -112,24 +121,26 @@ def ot_create_view(request):
             group_chat_id=settings.GROUP_CHAT_ID,
         )
         
-        # Fire Telegram broadcast synchronously
-        app = get_ptb_application()
-        if app and app._initialized:
-            announcement = format_announcement(event)
-            async def _send():
-                msg = await app.bot.send_message(
-                    chat_id=settings.GROUP_CHAT_ID,
-                    text=announcement,
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-                event.announcement_message_id = msg.message_id
-                event.save()
+        # Fire Telegram broadcast synchronously via raw Bot to bypass App loop initialization 
+        from telegram import Bot
+        announcement = format_announcement(event)
+        
+        async def _send():
+            bot_obj = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+            msg = await bot_obj.send_message(
+                chat_id=settings.GROUP_CHAT_ID,
+                text=announcement,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            event.announcement_message_id = msg.message_id
+            event.save()
             
-            try:
-                async_to_sync(_send)()
-                messages.success(request, f"OT '{title}' published successfully to Telegram!")
-            except Exception as e:
-                messages.error(request, f"Saved OT but failed to broadcast to Telegram: {e}")
+        try:
+            async_to_sync(_send)()
+            messages.success(request, f"OT '{title}' published successfully to Telegram!")
+        except Exception as e:
+            logger.error(f"Telegram broadcast failed: {e}")
+            messages.error(request, f"Saved OT but failed to broadcast to Telegram: {e}")
         
         return redirect("dashboard")
         
