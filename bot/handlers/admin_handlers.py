@@ -46,18 +46,6 @@ from bot.utils import (
     approve_list_keyboard,
     _esc,
 )
-from telegram import ReplyKeyboardMarkup
-
-# ── Custom Admin Keyboard ────────────────────────────────────────────────────
-def admin_keyboard():
-    keyboard = [
-        ["➕ New OT", "📝 Edit OT"],
-        ["📊 Status", "📈 Summary"],
-        ["📥 Export Signups", "🚪 Close Signups"],
-        ["❌ Remove Agent", "🗑️ Cancel OT"],
-        ["👥 Manage Admins"]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 # ── Conversation states ──────────────────────────────────────────────────────
 ASK_TITLE = 0
@@ -100,15 +88,6 @@ def admin_only(func):
             return ConversationHandler.END
         return await func(update, context)
     return wrapper
-
-
-@admin_only
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sends the persistent custom keyboard to the admin."""
-    await update.message.reply_text(
-        "Welcome to the Admin Panel! Choose an action below:",
-        reply_markup=admin_keyboard()
-    )
 
 
 @sync_to_async
@@ -487,14 +466,9 @@ async def receive_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
             time_slots[day] = [8.0] if day in WEEKEND_DAYS else [2.0, 4.0]
 
     edit_event_id = context.user_data.get("edit_event_id")
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     if edit_event_id:
         event = await _update_event(edit_event_id, title, days, time_slots, max_agents, deadline)
         announcement = format_announcement(event)
-        
-        keyboard = [[InlineKeyboardButton("🚀 Tap here to Sign Up", url=f"https://t.me/{context.bot.username}")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
         if getattr(event, 'announcement_message_id', None):
             try:
                 await context.bot.edit_message_text(
@@ -502,7 +476,6 @@ async def receive_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     message_id=event.announcement_message_id,
                     text=announcement,
                     parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=reply_markup,
                 )
             except Exception:
                 pass  # Message might be completely identical or deleted by an admin manually
@@ -519,15 +492,10 @@ async def receive_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
         event = await _create_event(title, uid, days, time_slots, max_agents, deadline)
         announcement = format_announcement(event)
 
-        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-        keyboard = [[InlineKeyboardButton("🚀 Tap here to Sign Up", url=f"https://t.me/{context.bot.username}")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
         msg = await context.bot.send_message(
             chat_id=settings.GROUP_CHAT_ID,
             text=announcement,
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=reply_markup,
         )
         await _save_message_id(event, msg.message_id)
 
@@ -607,12 +575,10 @@ async def cancel_event_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         # Try to edit the group announcement to mark as cancelled
         if ann_msg_id:
             try:
-                from telegram import InlineKeyboardMarkup
                 await context.bot.edit_message_text(
                     chat_id=ann_chat_id,
                     message_id=ann_msg_id,
                     text="CANCELLED\n\n(This OT event has been cancelled by an admin.)",
-                    reply_markup=InlineKeyboardMarkup([[]])
                 )
             except Exception:
                 pass
@@ -1076,10 +1042,8 @@ async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def build_admin_conversation() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[
-            CommandHandler("newot", newot_start),
-            MessageHandler(filters.Regex("^➕ New OT$"), newot_start),
-            CommandHandler("editot", editot_start),
-            MessageHandler(filters.Regex("^📝 Edit OT$"), editot_start),
+            CommandHandler("newot", newot_start, filters=filters.ChatType.PRIVATE),
+            CommandHandler("editot", editot_start, filters=filters.ChatType.PRIVATE),
         ],
         states={
             ASK_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_title)],

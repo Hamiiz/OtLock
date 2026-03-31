@@ -1,5 +1,5 @@
 import logging
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, filters
 from django.conf import settings
 
 from bot.handlers.admin_handlers import (
@@ -19,9 +19,7 @@ from bot.handlers.admin_handlers import (
     remove_admin_start,
     remove_admin_callback,
     list_admins,
-    admin_panel,
 )
-from telegram.ext import MessageHandler, filters
 from bot.handlers.user_handlers import build_user_conversation, my_ot
 
 logger = logging.getLogger(__name__)
@@ -49,33 +47,16 @@ def get_ptb_application():
         app.add_handler(build_user_conversation())
 
         # Standalone command handlers (outside conversation)
-        app.add_handler(CommandHandler("admin", admin_panel))
-        app.add_handler(CommandHandler("closesignup", close_signup))
-        app.add_handler(MessageHandler(filters.Regex("^🚪 Close Signups$"), close_signup))
-        
-        app.add_handler(CommandHandler("status", status_ot))
-        app.add_handler(MessageHandler(filters.Regex("^📊 Status$"), status_ot))
-        
-        app.add_handler(CommandHandler("remove", remove_ot_start))
-        app.add_handler(MessageHandler(filters.Regex("^❌ Remove Agent$"), remove_ot_start))
-        
-        app.add_handler(CommandHandler("cancelot", cancel_event_start))
-        app.add_handler(MessageHandler(filters.Regex("^🗑️ Cancel OT$"), cancel_event_start))
-        
-        app.add_handler(CommandHandler("summary", summary_ot))
-        app.add_handler(MessageHandler(filters.Regex("^📈 Summary$"), summary_ot))
-        
-        app.add_handler(CommandHandler("export", export_ot))
-        app.add_handler(MessageHandler(filters.Regex("^📥 Export Signups$"), export_ot))
-        
-        # User commands and existing specific commands
-        app.add_handler(CommandHandler("myot", my_ot))
-        app.add_handler(MessageHandler(filters.Regex("^📅 My OTs$"), my_ot))
-        
-        app.add_handler(CommandHandler("addadmin", add_admin_cmd))
-        app.add_handler(CommandHandler("removeadmin", remove_admin_start))
-        app.add_handler(CommandHandler("listadmins", list_admins))
-        app.add_handler(MessageHandler(filters.Regex("^👥 Manage Admins$"), list_admins))
+        app.add_handler(CommandHandler("closesignup", close_signup, filters=filters.ChatType.PRIVATE))
+        app.add_handler(CommandHandler("status", status_ot, filters=filters.ChatType.PRIVATE))
+        app.add_handler(CommandHandler("remove", remove_ot_start, filters=filters.ChatType.PRIVATE))
+        app.add_handler(CommandHandler("cancelot", cancel_event_start, filters=filters.ChatType.PRIVATE))
+        app.add_handler(CommandHandler("myot", my_ot, filters=filters.ChatType.PRIVATE))
+        app.add_handler(CommandHandler("summary", summary_ot, filters=filters.ChatType.PRIVATE))
+        app.add_handler(CommandHandler("export", export_ot, filters=filters.ChatType.PRIVATE))
+        app.add_handler(CommandHandler("addadmin", add_admin_cmd, filters=filters.ChatType.PRIVATE))
+        app.add_handler(CommandHandler("removeadmin", remove_admin_start, filters=filters.ChatType.PRIVATE))
+        app.add_handler(CommandHandler("listadmins", list_admins, filters=filters.ChatType.PRIVATE))
 
         # Inline button callbacks that live outside a conversation
         app.add_handler(CallbackQueryHandler(approve_and_send, pattern=r"^approve_list:"))

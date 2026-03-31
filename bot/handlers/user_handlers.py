@@ -33,14 +33,6 @@ from bot.utils import (
     _hours_label,
     _esc,
 )
-from telegram import ReplyKeyboardMarkup
-
-# ── Custom User Keyboard ─────────────────────────────────────────────────────
-def user_keyboard():
-    keyboard = [
-        ["📝 Sign Up", "📅 My OTs"]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 # ── Conversation states ──────────────────────────────────────────────────────
 PICK_DAYS = 0
@@ -107,22 +99,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Entry point – /start or first message in private chat."""
     context.user_data.clear()
 
-    # Determine role-based markup
-    from bot.handlers.admin_handlers import is_admin, admin_keyboard, _ensure_admins_loaded
-    await _ensure_admins_loaded()
-    is_user_admin = is_admin(update.effective_user.id)
-    markup = admin_keyboard() if is_user_admin else user_keyboard()
-
-    if update.message and update.message.text and update.message.text.startswith("/start"):
-        greeting = "Admin privileges confirmed. Use the menu below to manage." if is_user_admin else "Welcome to the OT Bot! Use the menu below."
-        await update.message.reply_text(greeting, reply_markup=markup)
-
     event = await _get_open_event()
     if event is None:
         await update.message.reply_text(
             "There is no active OT signup at the moment.\n"
-            "Watch the group for announcements!",
-            reply_markup=markup
+            "Watch the group for announcements!"
         )
         return ConversationHandler.END
 
@@ -407,8 +388,8 @@ async def my_ot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def build_user_conversation() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[
-            CommandHandler("start", start),
-            MessageHandler(filters.Regex("^📝 Sign Up$"), start),
+            CommandHandler("start", start, filters=filters.ChatType.PRIVATE),
+            MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, start),
         ],
         states={
             _ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name)],

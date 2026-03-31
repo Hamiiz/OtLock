@@ -12,7 +12,7 @@ from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.views.decorators.csrf import csrf_exempt
 
-from telegram import Update, Bot
+from telegram import Update
 from telegram.constants import ParseMode
 
 from bot.bot_app import get_ptb_application
@@ -95,19 +95,12 @@ def ot_create_view(request):
                 messages.error(request, "Invalid deadline format.")
                 return redirect("ot-create")
                 
-        # Time slots logic: Custom hours from form
+        # Time slots logic: simple default slots for the dashboard right now
+        # We can make it advanced later, but for V1 we assign standard slots.
+        from bot.utils import WEEKEND_DAYS
         time_slots = {}
         for day in days:
-            raw_slots = request.POST.get(f"slots_{day}", "").strip()
-            if raw_slots:
-                try:
-                    slot_list = [float(s.strip()) for s in raw_slots.split(",") if s.strip()]
-                    time_slots[day] = slot_list if slot_list else [8.0]
-                except ValueError:
-                    time_slots[day] = [8.0]
-            else:
-                from bot.utils import WEEKEND_DAYS
-                time_slots[day] = [8.0] if day in WEEKEND_DAYS else [2.0, 4.0]
+            time_slots[day] = [8.0] if day in WEEKEND_DAYS else [2.0, 4.0]
             
         event = OTEvent.objects.create(
             title=title,
@@ -119,41 +112,24 @@ def ot_create_view(request):
             group_chat_id=settings.GROUP_CHAT_ID,
         )
         
-        # Fire Telegram broadcast synchronously using strict urllib request
-        announcement = format_announcement(event)
-        try:
-            import json
-            import urllib.request
-            
-            me_req = urllib.request.Request(f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/getMe")
-            me_res = json.loads(urllib.request.urlopen(me_req).read())
-            bot_username = me_res["result"]["username"]
-            
-            keyboard = {
-                "inline_keyboard": [
-                    [{"text": "🚀 Tap here to Sign Up", "url": f"https://t.me/{bot_username}"}]
-                ]
-            }
-
-            url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
-            req = urllib.request.Request(url, method="POST")
-            req.add_header('Content-Type', 'application/json')
-            data = json.dumps({
-                "chat_id": settings.GROUP_CHAT_ID,
-                "text": announcement,
-                "parse_mode": "Markdown",
-                "reply_markup": keyboard
-            })
-            response = urllib.request.urlopen(req, data=data.encode('utf-8'))
-            res_data = json.loads(response.read())
-            if res_data.get("ok"):
-                event.announcement_message_id = res_data["result"]["message_id"]
+        # Fire Telegram broadcast synchronously
+        app = get_ptb_application()
+        if app and app._initialized:
+            announcement = format_announcement(event)
+            async def _send():
+                msg = await app.bot.send_message(
+                    chat_id=settings.GROUP_CHAT_ID,
+                    text=announcement,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                event.announcement_message_id = msg.message_id
                 event.save()
             
-            messages.success(request, f"OT '{title}' published successfully to Telegram!")
-        except Exception as e:
-            logger.error(f"Broadcast failed: {e}")
-            messages.error(request, f"Saved OT but failed to broadcast to Telegram. Please check logs.")
+            try:
+                async_to_sync(_send)()
+                messages.success(request, f"OT '{title}' published successfully to Telegram!")
+            except Exception as e:
+                messages.error(request, f"Saved OT but failed to broadcast to Telegram: {e}")
         
         return redirect("dashboard")
         
@@ -187,27 +163,7 @@ def ot_close_view(request, pk):
         event = get_object_or_404(OTEvent, pk=pk)
         event.is_open = False
         event.save()
-        
-        # Broadcast the closure to Telegram dynamically updating the message
-        try:
-            import json
-            import urllib.request
-            announcement = format_announcement(event)
-            url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/editMessageText"
-            req = urllib.request.Request(url, method="POST")
-            req.add_header('Content-Type', 'application/json')
-            data = json.dumps({
-                "chat_id": event.group_chat_id,
-                "message_id": event.announcement_message_id,
-                "text": announcement,
-                "parse_mode": "Markdown",
-                "reply_markup": {"inline_keyboard": []}
-            })
-            urllib.request.urlopen(req, data=data.encode('utf-8'))
-        except Exception as e:
-            logger.error(f"Failed to update pinned message upon closing: {e}")
-
-        messages.success(request, f"OT Event '{event.title}' is now closed and announcement updated.")
+        messages.success(request, f"OT Event '{event.title}' is now closed.")
     return redirect("dashboard")
 
 
