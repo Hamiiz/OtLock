@@ -46,6 +46,10 @@
                         <input type="checkbox" name="weekday_slots" value="4.0" checked style="accent-color: var(--primary); width: 1.1rem; height: 1.1rem;"> 4 Hours
                     </label>
                 </div>
+                <div style="margin-top: 0.75rem;">
+                    <label class="form-label" style="font-size: 0.85rem; color: var(--text-muted);">Extra custom hours <span style="font-weight:400">(comma-separated, e.g. 3, 6)</span></label>
+                    <input type="text" name="weekday_custom_hours" class="form-control" placeholder="e.g. 3, 6" style="margin-top: 0.25rem;">
+                </div>
             </div>
 
             <div class="form-group mb-2" style="padding-bottom: 1rem; border-bottom: 1px solid rgba(255,255,255,0.05);">
@@ -60,6 +64,10 @@
                     <label style="display: flex; align-items: center; gap: 0.5rem; background: rgba(15, 23, 42, 0.4); border: 1px solid var(--glass-border); padding: 0.6rem 1rem; border-radius: 8px; cursor: pointer; transition: all 0.2s;" onmouseover="this.style.background='rgba(59, 130, 246, 0.1)'" onmouseout="this.style.background='rgba(15, 23, 42, 0.4)'">
                         <input type="checkbox" name="weekend_slots" value="12.0" checked style="accent-color: var(--primary); width: 1.1rem; height: 1.1rem;"> 12 Hours
                     </label>
+                </div>
+                <div style="margin-top: 0.75rem;">
+                    <label class="form-label" style="font-size: 0.85rem; color: var(--text-muted);">Extra custom hours <span style="font-weight:400">(comma-separated, e.g. 6, 9)</span></label>
+                    <input type="text" name="weekend_custom_hours" class="form-control" placeholder="e.g. 6, 9" style="margin-top: 0.25rem;">
                 </div>
             </div>
 
@@ -76,7 +84,7 @@
             </div>
 
             {% if available_days %}
-                <button type="submit" class="btn" style="width: 100%; padding: 1rem; font-size: 1.1rem; justify-content: center;">
+                <button type="submit" class="btn" style="width: 100%; padding: 1rem; font-size: 1.1rem; justify-content: center;" onclick="return confirm('Publish this OT event and send an announcement to the Telegram group?')">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" style="width: 20px; height: 20px;">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path>
                     </svg>

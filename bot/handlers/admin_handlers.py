@@ -16,7 +16,11 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 from datetime import timedelta
+from io import BytesIO
+
+logger = logging.getLogger(__name__)
 
 from asgiref.sync import sync_to_async
 
@@ -44,6 +48,8 @@ from bot.utils import (
     format_announcement,
     format_signup_list,
     approve_list_keyboard,
+    select_event_keyboard,
+    announcement_keyboard,
     _esc,
 )
 
@@ -469,6 +475,7 @@ async def receive_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if edit_event_id:
         event = await _update_event(edit_event_id, title, days, time_slots, max_agents, deadline)
         announcement = format_announcement(event)
+        keyboard = announcement_keyboard(settings.BOT_USERNAME)
         if getattr(event, 'announcement_message_id', None):
             try:
                 await context.bot.edit_message_text(
@@ -476,6 +483,7 @@ async def receive_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     message_id=event.announcement_message_id,
                     text=announcement,
                     parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=keyboard,
                 )
             except Exception:
                 pass  # Message might be completely identical or deleted by an admin manually
@@ -491,13 +499,24 @@ async def receive_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         event = await _create_event(title, uid, days, time_slots, max_agents, deadline)
         announcement = format_announcement(event)
+        keyboard = announcement_keyboard(settings.BOT_USERNAME)
 
         msg = await context.bot.send_message(
             chat_id=settings.GROUP_CHAT_ID,
             text=announcement,
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard,
         )
         await _save_message_id(event, msg.message_id)
+
+        # Schedule a deadline alert job if a deadline was set
+        if deadline and context.job_queue:
+            context.job_queue.run_once(
+                deadline_alert,
+                when=deadline,
+                data={"event_id": event.id},
+                name=f"deadline_alert_{event.id}",
+            )
 
         max_str = str(max_agents) if max_agents else "Unlimited"
         deadline_str = f", closes in {text}h" if deadline else ""
@@ -511,6 +530,121 @@ async def receive_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data.clear()
     return ConversationHandler.END
+
+
+# ── Deadline alert job ────────────────────────────────────────────────────────
+
+@sync_to_async
+def _get_event_with_signups(event_id: int):
+    from bot.models import OTSignup
+    event = OTEvent.objects.get(pk=event_id)
+    signups = list(
+        OTSignup.objects.filter(ot_event=event)
+        .select_related("agent")
+        .order_by("day", "confirmed_at")
+    )
+    # Close the event now
+    event.is_open = False
+    event.save()
+    return event, signups
+
+
+async def deadline_alert(context) -> None:
+    """PTB JobQueue job: fires at deadline, notifies all admins and lets them publish the final list."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    from bot.utils import format_signup_list, generate_csv, _esc, CLASS_TYPES
+
+    job_data = context.job.data
+    event_id = job_data["event_id"]
+
+    try:
+        event, signups = await _get_event_with_signups(event_id)
+    except OTEvent.DoesNotExist:
+        return  # Already deleted
+
+    signup_text = format_signup_list(event, signups)
+    csv_bytes = generate_csv(event, signups)
+    csv_filename = f"ot_{event.id}_{event.title.replace(' ', '_')[:30]}.csv"
+
+    confirm_kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Post Final List to Group", callback_data=f"dl_post:{event.id}"),
+            InlineKeyboardButton("❌ Skip", callback_data=f"dl_skip:{event.id}"),
+        ]
+    ])
+
+    await _ensure_admins_loaded()
+    all_admin_ids = list(settings.ADMIN_IDS) + list(_dynamic_admins)
+
+    for admin_id in set(all_admin_ids):
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    f"⏰ *OT Deadline Reached* — *{_esc(event.title)}* has been auto-closed.\n\n"
+                    f"{signup_text}\n\n"
+                    "Do you want to post the final signup list to the group?"
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=confirm_kb,
+            )
+            await context.bot.send_document(
+                chat_id=admin_id,
+                document=BytesIO(csv_bytes),
+                filename=csv_filename,
+                caption=f"📊 Export for *{_esc(event.title)}*",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception as exc:
+            logger.warning(f"Could not DM admin {admin_id}: {exc}")
+
+
+async def deadline_post_confirm(update, context) -> None:
+    """Callback for the 'Post to Group' / 'Skip' inline buttons after a deadline alert."""
+    from bot.utils import format_signup_list, _esc
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split(":", 1)
+    action = parts[0]  # dl_post or dl_skip
+    event_id = int(parts[1])
+
+    if action == "dl_skip":
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("Skipped — final list was NOT posted to the group.")
+        return
+
+    try:
+        event = await _get_event(event_id)
+        signups = await _get_signups(event)
+        signup_text = format_signup_list(event, signups)
+        closed_text = signup_text + "\n\n_Signups are now CLOSED._"
+
+        if event.announcement_message_id and event.group_chat_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=event.group_chat_id,
+                    message_id=event.announcement_message_id,
+                    text=closed_text,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                await context.bot.send_message(
+                    chat_id=settings.GROUP_CHAT_ID,
+                    text=closed_text,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+        else:
+            await context.bot.send_message(
+                chat_id=settings.GROUP_CHAT_ID,
+                text=closed_text,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(f"✅ Final list for *{_esc(event.title)}* has been posted to the group.", parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await query.message.reply_text(f"Failed to post: {e}")
 
 
 async def cancel_newot(update: Update, context: ContextTypes.DEFAULT_TYPE):

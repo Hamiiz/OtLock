@@ -145,8 +145,22 @@ def format_announcement(event) -> str:
         f"*{_esc(event.title)}*\n\n"
         f"*Available Days:*\n  {days_str}\n\n"
         f"*Time Slots:*\n{slots_block}\n\n"
-        f"*Max Sign-ups:* {max_str}{deadline_str}\n\n"
-        f"To sign up: open the bot in private chat and follow the prompts!"
+        f"*Max Sign-ups:* {max_str}{deadline_str}"
+    )
+
+
+def announcement_keyboard(bot_username: str) -> InlineKeyboardMarkup | None:
+    """Return an inline keyboard with a Sign Up button linking to bot DM. Returns
+    None if bot_username is not configured, so callers can skip reply_markup safely."""
+    if not bot_username:
+        return None
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton(
+                "📝 Sign Up Now",
+                url=f"https://t.me/{bot_username}"
+            )
+        ]]
     )
 
 
@@ -179,6 +193,52 @@ def format_signup_list(event, signups) -> str:
     unique_agents = len({s.agent_id for s in signups})
     lines.append(f"\nTotal: {unique_agents} agent(s), {total_slots} slot(s)")
     return "\n".join(lines)
+
+
+def select_event_keyboard(events, callback_prefix: str) -> InlineKeyboardMarkup:
+    """Generate a vertical list of buttons for selecting an active OT event."""
+    buttons = []
+    for event in events:
+        buttons.append([
+            InlineKeyboardButton(
+                event.title, 
+                callback_data=f"{callback_prefix}:{event.id}"
+            )
+        ])
+    return InlineKeyboardMarkup(buttons)
+
+
+CLASS_TYPE_ORDER = ["DIALER", "IB", "TOPLIST"]
+
+
+def generate_csv(event, signups) -> bytes:
+    """Generate a CSV export grouped by Class → Day, returned as UTF-8 bytes."""
+    import csv
+    import io
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Class", "Day", "Agent", "Hours", "Confirmed At"])
+    # Sort by class order, then by day index within the event, then by confirmed_at
+    day_order = {d: i for i, d in enumerate(event.days)}
+    class_order = {c: i for i, c in enumerate(CLASS_TYPE_ORDER)}
+    sorted_signups = sorted(
+        signups,
+        key=lambda s: (
+            class_order.get(s.class_type, 99),
+            day_order.get(s.day, 99),
+            s.confirmed_at or "",
+        )
+    )
+    class_labels = dict(CLASS_TYPES)
+    for s in sorted_signups:
+        writer.writerow([
+            class_labels.get(s.class_type, s.class_type),
+            s.day,
+            s.agent.agent_name,
+            float(s.hours),
+            s.confirmed_at.strftime("%Y-%m-%d %H:%M") if s.confirmed_at else "",
+        ])
+    return buf.getvalue().encode("utf-8")
 
 
 def approve_list_keyboard(event_id: int) -> InlineKeyboardMarkup:

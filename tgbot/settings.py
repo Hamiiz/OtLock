@@ -69,7 +69,7 @@ LOGOUT_REDIRECT_URL = 'login'
 DATABASES = {
     "default": dj_database_url.config(
         default=os.environ.get("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/tgbot_db"),
-        conn_max_age=0,
+        conn_max_age=60,
     )
 }
 
@@ -98,3 +98,4 @@ ADMIN_IDS = [
     if x.strip().isdigit()
 ]
 GROUP_CHAT_ID = int(os.environ.get("GROUP_CHAT_ID", "0"))
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "")  # e.g. OTSignupBot (no @ sign)

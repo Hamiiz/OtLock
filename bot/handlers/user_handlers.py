@@ -80,12 +80,19 @@ def _any_signup_for_event(agent, event):
 
 @sync_to_async
 def _create_signup(agent, event, day, hours, class_type):
-    return OTSignup.objects.get_or_create(
-        agent=agent,
-        ot_event=event,
-        day=day,
-        defaults=dict(hours=hours, class_type=class_type),
-    )
+    from django.db import transaction
+    with transaction.atomic():
+        # Re-fetch the event with a row-level lock to prevent race conditions
+        # on max_agents when two users confirm at the same moment.
+        ev = OTEvent.objects.select_for_update().get(pk=event.pk)
+        if ev.is_full():
+            return None, False   # caller handles the "event is full" case
+        return OTSignup.objects.get_or_create(
+            agent=agent,
+            ot_event=ev,
+            day=day,
+            defaults=dict(hours=hours, class_type=class_type),
+        )
 
 
 @sync_to_async

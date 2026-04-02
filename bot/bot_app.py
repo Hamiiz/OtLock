@@ -19,6 +19,7 @@ from bot.handlers.admin_handlers import (
     remove_admin_start,
     remove_admin_callback,
     list_admins,
+    deadline_post_confirm,
 )
 from bot.handlers.user_handlers import build_user_conversation, my_ot
 
@@ -38,7 +39,7 @@ def get_ptb_application():
             logger.error("TELEGRAM_BOT_TOKEN is not set.")
             return None
             
-        app = Application.builder().token(token).concurrent_updates(False).build()
+        app = Application.builder().token(token).concurrent_updates(True).build()
 
         # Register admin conversation (/newot flow)
         app.add_handler(build_admin_conversation())
@@ -66,6 +67,8 @@ def get_ptb_application():
         app.add_handler(CallbackQueryHandler(cancel_event_confirm, pattern=r"^cancelot_confirm:"))
         app.add_handler(CallbackQueryHandler(cancel_event_confirm, pattern=r"^cancelot_abort$"))
         app.add_handler(CallbackQueryHandler(remove_admin_callback, pattern=r"^rmadmin:"))
+        app.add_handler(CallbackQueryHandler(deadline_post_confirm, pattern=r"^dl_post:"))
+        app.add_handler(CallbackQueryHandler(deadline_post_confirm, pattern=r"^dl_skip:"))
 
         _ptb_application = app
     return _ptb_application

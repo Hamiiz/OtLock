@@ -1,9 +1,12 @@
+import csv
+import io
 import json
 import logging
+import asyncio
+import threading
 from datetime import datetime
-from asgiref.sync import async_to_sync
 
-from django.http import JsonResponse, HttpResponseRedirect
+from django.http import JsonResponse
 from django.shortcuts import render, redirect, get_object_or_404
 from django.urls import reverse
 from django.utils import timezone
@@ -12,12 +15,12 @@ from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.views.decorators.csrf import csrf_exempt
 
-from telegram import Update
+from telegram import Bot, Update
 from telegram.constants import ParseMode
 
 from bot.bot_app import get_ptb_application
-from bot.models import OTEvent
-from bot.utils import format_announcement, _esc
+from bot.models import OTEvent, OTSignup
+from bot.utils import format_announcement, format_signup_list, announcement_keyboard, _esc
 
 logger = logging.getLogger(__name__)
 
@@ -95,13 +98,29 @@ def ot_create_view(request):
                 messages.error(request, "Invalid deadline format.")
                 return redirect("ot-create")
                 
-        # Time slots logic: User selection via form checkboxes
+        # Time slots logic: User selection via form checkboxes + optional custom hours
         weekday_slots_str = request.POST.getlist("weekday_slots")
         weekend_slots_str = request.POST.getlist("weekend_slots")
+        weekday_custom_raw = request.POST.get("weekday_custom_hours", "").strip()
+        weekend_custom_raw = request.POST.get("weekend_custom_hours", "").strip()
         
+        def _parse_custom(raw):
+            result = []
+            for part in raw.split(","):
+                part = part.strip()
+                try:
+                    val = float(part)
+                    if val > 0:
+                        result.append(val)
+                except ValueError:
+                    pass
+            return result
+
         # Fallback to defaults if they unchecked everything
         weekday_slots = [float(s) for s in weekday_slots_str] if weekday_slots_str else [2.0, 4.0]
+        weekday_slots += [h for h in _parse_custom(weekday_custom_raw) if h not in weekday_slots]
         weekend_slots = [float(s) for s in weekend_slots_str] if weekend_slots_str else [8.0, 10.0, 12.0]
+        weekend_slots += [h for h in _parse_custom(weekend_custom_raw) if h not in weekend_slots]
 
         from bot.utils import WEEKEND_DAYS
         time_slots = {}
@@ -121,22 +140,34 @@ def ot_create_view(request):
             group_chat_id=settings.GROUP_CHAT_ID,
         )
         
-        # Fire Telegram broadcast synchronously via raw Bot to bypass App loop initialization 
+        # Fire Telegram broadcast synchronously via raw Bot in a separate thread
         from telegram import Bot
         announcement = format_announcement(event)
         
+        def _run_async(coro):
+            """Run an async coroutine safely in a fresh event loop."""
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(coro)
+            finally:
+                loop.close()
+        
         async def _send():
             bot_obj = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+            keyboard = announcement_keyboard(settings.BOT_USERNAME)
             msg = await bot_obj.send_message(
                 chat_id=settings.GROUP_CHAT_ID,
                 text=announcement,
                 parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard,
             )
             event.announcement_message_id = msg.message_id
             event.save()
             
         try:
-            async_to_sync(_send)()
+            thread = threading.Thread(target=_run_async, args=(_send(),))
+            thread.start()
+            thread.join(timeout=10)
             messages.success(request, f"OT '{title}' published successfully to Telegram!")
         except Exception as e:
             logger.error(f"Telegram broadcast failed: {e}")
@@ -170,11 +201,102 @@ def ot_edit_view(request, pk):
 
 @login_required
 def ot_close_view(request, pk):
-    if request.method == "POST":
-        event = get_object_or_404(OTEvent, pk=pk)
-        event.is_open = False
-        event.save()
-        messages.success(request, f"OT Event '{event.title}' is now closed.")
+    if request.method != "POST":
+        return redirect("dashboard")
+
+    event = get_object_or_404(OTEvent, pk=pk)
+    event.is_open = False
+    event.save()
+
+    # Compile signup list
+    signups = list(
+        OTSignup.objects.filter(ot_event=event)
+        .select_related("agent")
+        .order_by("day", "confirmed_at")
+    )
+    signup_text = format_signup_list(event, signups)
+
+    # Build CSV bytes
+    csv_buffer = io.StringIO()
+    writer = csv.writer(csv_buffer)
+    writer.writerow(["Agent", "Day", "Hours", "Class", "Confirmed At"])
+    for s in signups:
+        writer.writerow([
+            s.agent.agent_name,
+            s.day,
+            float(s.hours),
+            s.class_type,
+            s.confirmed_at.strftime("%Y-%m-%d %H:%M") if s.confirmed_at else "",
+        ])
+    csv_bytes = csv_buffer.getvalue().encode("utf-8")
+    csv_filename = f"ot_{event.id}_{event.title.replace(' ', '_')[:30]}.csv"
+
+    def _run_async(coro):
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    async def _broadcast_close():
+        bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
+
+        # 1. Post final signup list to the group
+        try:
+            # Edit the original announcement to mark as closed
+            if event.announcement_message_id and event.group_chat_id:
+                try:
+                    closed_text = signup_text + "\n\n_Signups are now CLOSED._"
+                    await bot.edit_message_text(
+                        chat_id=event.group_chat_id,
+                        message_id=event.announcement_message_id,
+                        text=closed_text,
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception:
+                    # If edit fails (e.g. too old), send a fresh message
+                    await bot.send_message(
+                        chat_id=settings.GROUP_CHAT_ID,
+                        text=signup_text + "\n\n_Signups are now CLOSED._",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+            else:
+                await bot.send_message(
+                    chat_id=settings.GROUP_CHAT_ID,
+                    text=signup_text + "\n\n_Signups are now CLOSED._",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+        except Exception as exc:
+            logger.error(f"Failed to post closure to group: {exc}")
+
+        # 2. DM every admin with the signup list + CSV
+        from io import BytesIO
+        for admin_id in settings.ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=f"*OT Closed from Dashboard*\n\n{signup_text}",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                await bot.send_document(
+                    chat_id=admin_id,
+                    document=BytesIO(csv_bytes),
+                    filename=csv_filename,
+                    caption=f"Full signup export for *{_esc(event.title)}*",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception as exc:
+                logger.warning(f"Could not DM admin {admin_id}: {exc}")
+
+    try:
+        thread = threading.Thread(target=_run_async, args=(_broadcast_close(),))
+        thread.start()
+        thread.join(timeout=15)
+        messages.success(request, f"OT '{event.title}' closed. Signup list posted to group & sent to admins.")
+    except Exception as e:
+        logger.error(f"Close broadcast failed: {e}")
+        messages.error(request, f"OT closed but broadcast failed: {e}")
+
     return redirect("dashboard")
 
 
