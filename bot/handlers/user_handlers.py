@@ -29,12 +29,14 @@ from bot.utils import (
     user_hour_keyboard,
     class_keyboard,
     confirm_keyboard,
+    select_event_keyboard,
     CLASS_TYPES,
     _hours_label,
     _esc,
 )
 
 # ── Conversation states ──────────────────────────────────────────────────────
+PICK_EVENT = 4
 PICK_DAYS = 0
 PICK_HOURS = 1
 PICK_CLASS = 2
@@ -61,9 +63,17 @@ def _get_agent(telegram_id):
 
 
 @sync_to_async
-def _get_open_event():
-    """Return the most recently created open OT event, or None."""
-    return OTEvent.objects.filter(is_open=True).order_by("-created_at").first()
+def _get_open_events():
+    """Return all currently open OT events."""
+    return list(OTEvent.objects.filter(is_open=True).order_by("-created_at"))
+
+
+@sync_to_async
+def _get_event(event_id):
+    try:
+        return OTEvent.objects.get(pk=event_id, is_open=True)
+    except OTEvent.DoesNotExist:
+        return None
 
 
 @sync_to_async
@@ -79,20 +89,36 @@ def _any_signup_for_event(agent, event):
 
 
 @sync_to_async
+def _has_signup_in_any_open_event(agent):
+    """True if agent has a signup in any currently open OT event."""
+    from bot.models import OTEvent
+    return OTSignup.objects.filter(agent=agent, ot_event__is_open=True).exists()
+
+
+@sync_to_async
 def _create_signup(agent, event, day, hours, class_type):
     from django.db import transaction
     with transaction.atomic():
         # Re-fetch the event with a row-level lock to prevent race conditions
         # on max_agents when two users confirm at the same moment.
         ev = OTEvent.objects.select_for_update().get(pk=event.pk)
+        # Enforce one-open-OT-per-user rule at commit time as well.
+        # This closes race windows between /start and final confirmation.
+        has_other_open = OTSignup.objects.filter(
+            agent=agent,
+            ot_event__is_open=True,
+        ).exclude(ot_event=ev).exists()
+        if has_other_open:
+            return None, "other_open_event"
         if ev.is_full():
-            return None, False   # caller handles the "event is full" case
-        return OTSignup.objects.get_or_create(
+            return None, "full"   # caller handles the "event is full" case
+        signup, created = OTSignup.objects.get_or_create(
             agent=agent,
             ot_event=ev,
             day=day,
             defaults=dict(hours=hours, class_type=class_type),
         )
+        return signup, "created" if created else "exists"
 
 
 @sync_to_async
@@ -106,32 +132,103 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Entry point – /start or first message in private chat."""
     context.user_data.clear()
 
-    event = await _get_open_event()
-    if event is None:
+    # 1. Check for deep-link argument
+    event = None
+    if context.args:
+        arg = context.args[0]
+        # Accept both current and older deep-link payloads.
+        try:
+            if arg.startswith("signup_"):
+                eid = int(arg.split("_", 1)[1])
+                event = await _get_event(eid)
+            elif arg.startswith("ot_"):
+                eid = int(arg.split("_", 1)[1])
+                event = await _get_event(eid)
+        except (IndexError, ValueError):
+            event = None
+
+    # 2. Check for ANY signup if they are a known agent
+    existing_agent = await _get_agent(update.effective_user.id)
+    if existing_agent and await _has_signup_in_any_open_event(existing_agent):
         await update.message.reply_text(
-            "There is no active OT signup at the moment.\n"
-            "Watch the group for announcements!"
+            "You already have an active OT signup.\n"
+            "You cannot sign up for more than one OT at the same time.",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return ConversationHandler.END
 
+    # 3. Handle event selection
+    if not event:
+        events = await _get_open_events()
+        if not events:
+            await update.message.reply_text(
+                "There is no active OT signup at the moment.\n"
+                "Watch the group for announcements!"
+            )
+            return ConversationHandler.END
+        
+        if len(events) == 1:
+            event = events[0]
+        else:
+            # Multi-OT: show picker
+            keyboard = select_event_keyboard(events, "user_signup")
+            await update.message.reply_text(
+                "Multiple OT shifts are active.\n"
+                "Pick the exact OT for your shift from the list below:",
+                reply_markup=keyboard
+            )
+            return PICK_EVENT
+
+    # 4. Proceed with selected event
     if await _event_is_full(event):
         await update.message.reply_text(
-            "The OT signup is currently full. No more spots available."
+            f"The OT signup for *{_esc(event.title)}* is currently full.",
+            parse_mode=ParseMode.MARKDOWN
         )
         return ConversationHandler.END
 
     context.user_data["event_id"] = event.id
+    return await _start_signup_flow(update, context, event)
 
+
+async def select_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback for when a user picks an event from the multi-OT picker."""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data  # "user_signup:123"
+    try:
+        event_id = int(data.split(":")[1])
+        event = await _get_event(event_id)
+        if not event:
+            await query.edit_message_text("This OT event is no longer active.")
+            return ConversationHandler.END
+        
+        if await _event_is_full(event):
+            await query.edit_message_text(f"The OT signup for *{_esc(event.title)}* is currently full.", parse_mode=ParseMode.MARKDOWN)
+            return ConversationHandler.END
+
+        context.user_data["event_id"] = event.id
+        # We need to manually call the next step because start() logic didn't finish
+        return await _start_signup_flow(update, context, event)
+    except (IndexError, ValueError):
+        await query.edit_message_text("Invalid selection.")
+        return ConversationHandler.END
+
+
+async def _start_signup_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, event):
+    """Internal helper to shared logic for starting the actual signup steps."""
     # Check for existing agent
     existing_agent = await _get_agent(update.effective_user.id)
     if existing_agent:
+        # Check if already signed up specifically for this event
         already = await _any_signup_for_event(existing_agent, event)
         if already:
-            await update.message.reply_text(
-                f"You already have signups for *{_esc(event.title)}*!\n"
-                "You cannot change or cancel your signup.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
+            msg = f"You already have signups for *{_esc(event.title)}*!\nYou cannot change or cancel your signup."
+            if update.callback_query:
+                await update.callback_query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
+            else:
+                await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
             return ConversationHandler.END
 
         context.user_data["agent_name"] = existing_agent.agent_name
@@ -143,8 +240,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["selected_days"] = []
     context.user_data["day_hours"] = {}   # {day: hours}
 
+    async def _send_text(text, **kwargs):
+        if update.callback_query:
+            await update.callback_query.message.reply_text(text, **kwargs)
+        else:
+            await update.message.reply_text(text, **kwargs)
+
     if not context.user_data["agent_known"]:
-        await update.message.reply_text(
+        await _send_text(
             f"Welcome! You're signing up for *{_esc(event.title)}*.\n\n"
             "Please enter your *agent name* exactly as it appears in your roster:",
             parse_mode=ParseMode.MARKDOWN,
@@ -153,7 +256,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["event_days"] = event.days
         return _ASK_NAME
 
-    await update.message.reply_text(
+    await _send_text(
         f"Welcome back, *{_esc(existing_agent.agent_name)}*!\n\n"
         f"Signing up for: *{_esc(event.title)}*\n\n"
         "Select the days you want to work OT.\n"
@@ -312,7 +415,8 @@ async def confirm_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return ConversationHandler.END
 
-    event = await _get_open_event()
+    event_id = context.user_data.get("event_id")
+    event = await _get_event(event_id) if event_id else None
     if event is None:
         await query.edit_message_text("The OT event has been closed. Signup could not be saved.")
         return ConversationHandler.END
@@ -324,14 +428,40 @@ async def confirm_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     class_label = dict(CLASS_TYPES).get(class_type, "")
 
     saved = []
+    blocked_other_open = False
+    event_full = False
     for day, hours in day_hours.items():
         already = await _already_signed_up_day(agent, event, day)
         if not already:
-            await _create_signup(agent=agent, event=event, day=day, hours=hours, class_type=class_type)
-            saved.append((day, hours))
+            _, status = await _create_signup(
+                agent=agent,
+                event=event,
+                day=day,
+                hours=hours,
+                class_type=class_type,
+            )
+            if status == "created":
+                saved.append((day, hours))
+            elif status == "other_open_event":
+                blocked_other_open = True
+                break
+            elif status == "full":
+                event_full = True
+                break
 
     if not saved:
-        await query.edit_message_text("You were already signed up for all selected days.")
+        if blocked_other_open:
+            await query.edit_message_text(
+                "You already have an active OT signup in another open event.\n"
+                "You cannot sign up for more than one OT at the same time."
+            )
+        elif event_full:
+            await query.edit_message_text(
+                f"The OT signup for *{_esc(event.title)}* is currently full.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await query.edit_message_text("You were already signed up for all selected days.")
         return ConversationHandler.END
 
     lines = ["*Signed up!*\n", f"*{_esc(event.title)}*", f"Class: {_esc(class_label)}\n"]
@@ -358,31 +488,38 @@ async def my_ot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
 
-    event = await _get_open_event()
-    if event is None:
-        await update.message.reply_text("There is no active OT event.")
-        return
-
     user_id = update.effective_user.id
     agent = await _get_agent(user_id)
     if not agent:
         await update.message.reply_text("You haven't signed up for any OT yet.")
         return
         
-    from bot.models import OTSignup
-    signups = await sync_to_async(list)(OTSignup.objects.filter(agent=agent, ot_event=event))
+    from bot.models import OTSignup, OTEvent
+    # Show signups for ALL active events
+    signups = await sync_to_async(list)(
+        OTSignup.objects.filter(agent=agent, ot_event__is_open=True)
+    )
     if not signups:
-        await update.message.reply_text(f"You haven't signed up for *{_esc(event.title)}* yet.", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("You have no active OT signups at the moment.")
         return
 
-    lines = [f"*Your OT Signups for {_esc(event.title)}*\n"]
-    for signup in signups:
-        hrs = float(signup.hours)
-        class_label = dict(CLASS_TYPES).get(signup.class_type, signup.class_type)
-        label = _hours_label(signup.day, hrs)
-        lines.append(f"  {signup.day}: *{label}* — {class_label}")
+    # Group by event
+    from collections import defaultdict
+    by_event = defaultdict(list)
+    for s in signups:
+        by_event[s.ot_event].append(s)
+
+    lines = ["*Your Active OT Signups*\n"]
+    for event, event_signups in by_event.items():
+        lines.append(f"📦 *{_esc(event.title)}*")
+        for s in event_signups:
+            hrs = float(s.hours)
+            class_label = dict(CLASS_TYPES).get(s.class_type, s.class_type)
+            label = _hours_label(s.day, hrs)
+            lines.append(f"  • {s.day}: *{label}* — {class_label}")
+        lines.append("")
     
-    lines.append("\nYou cannot cancel your confirmed signups. Contact an admin if you need to make changes.")
+    lines.append("You cannot cancel your confirmed signups. Contact an admin if you need to make changes.")
     
     await update.message.reply_text(
         "\n".join(lines),
@@ -399,6 +536,7 @@ def build_user_conversation() -> ConversationHandler:
             MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, start),
         ],
         states={
+            PICK_EVENT: [CallbackQueryHandler(select_event, pattern=r"^user_signup:")],
             _ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name)],
             PICK_DAYS: [
                 CallbackQueryHandler(toggle_day, pattern=r"^uday_toggle:"),

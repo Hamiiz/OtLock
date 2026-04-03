@@ -34,6 +34,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.constants import ParseMode
+from telegram.error import TimedOut, NetworkError
 
 from django.conf import settings
 from django.utils import timezone
@@ -47,7 +48,6 @@ from bot.utils import (
     _hours_label,
     format_announcement,
     format_signup_list,
-    approve_list_keyboard,
     select_event_keyboard,
     announcement_keyboard,
     _esc,
@@ -60,6 +60,23 @@ ASK_SLOTS = 2
 ASK_SLOT_CUSTOM = 3
 ASK_MAX = 4
 ASK_DEADLINE = 5
+
+
+async def _tg_call(coro_factory, retries: int = 3, delay_seconds: float = 0.8):
+    """Retry Telegram API calls for transient network timeouts/errors."""
+    import asyncio
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return await coro_factory()
+        except (TimedOut, NetworkError) as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                await asyncio.sleep(delay_seconds * (attempt + 1))
+                continue
+            raise
+    if last_exc:
+        raise last_exc
 
 
 # ── Dynamic admin management ─────────────────────────────────────────────────
@@ -88,6 +105,7 @@ def is_admin(user_id: int) -> bool:
 def admin_only(func):
     """Decorator that silently ignores non-admin users."""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await _ensure_admins_loaded()
         uid = update.effective_user.id
         if not is_admin(uid):
             await update.message.reply_text("You are not authorised to use this command.")
@@ -139,29 +157,11 @@ def _get_signup_count(event_id: int) -> int:
 
 
 @sync_to_async
-def _db_add_admin(telegram_id, username, name, added_by):
-    from bot.models import AdminUser
-    AdminUser.objects.get_or_create(
-        telegram_id=telegram_id,
-        defaults={'telegram_username': username or '', 'telegram_name': name or '', 'added_by': added_by}
-    )
-
-
-@sync_to_async
-def _db_remove_admin(telegram_id):
-    from bot.models import AdminUser
-    AdminUser.objects.filter(telegram_id=telegram_id).delete()
-
-
-@sync_to_async
-def _get_all_dynamic_admins():
-    from bot.models import AdminUser
-    return list(AdminUser.objects.all())
-
-
-@sync_to_async
 def _get_event(event_id):
-    return OTEvent.objects.get(pk=event_id)
+    try:
+        return OTEvent.objects.get(pk=event_id)
+    except OTEvent.DoesNotExist:
+        return None
 
 
 @sync_to_async
@@ -186,16 +186,30 @@ def _save_message_id(event, msg_id):
 
 
 @sync_to_async
-def _delete_event(event_id: int):
-    """Delete an OT event and all its signups by ID."""
-    OTEvent.objects.filter(pk=event_id).prefetch_related("signups")  # eager
-    # Cascade delete handles signups automatically (on_delete=CASCADE)
-    OTEvent.objects.filter(pk=event_id).delete()
+def _db_add_admin(telegram_id, username, name, added_by):
+    from bot.models import AdminUser
+    AdminUser.objects.get_or_create(
+        telegram_id=telegram_id,
+        defaults={'telegram_username': username or '', 'telegram_name': name or '', 'added_by': added_by}
+    )
 
 
 @sync_to_async
-def _get_signup_count(event_id: int) -> int:
-    return OTSignup.objects.filter(ot_event_id=event_id).count()
+def _db_remove_admin(telegram_id):
+    from bot.models import AdminUser
+    AdminUser.objects.filter(telegram_id=telegram_id).delete()
+
+
+@sync_to_async
+def _get_all_dynamic_admins():
+    from bot.models import AdminUser
+    return list(AdminUser.objects.all())
+
+
+@sync_to_async
+def _delete_event(event_id: int):
+    """Delete an OT event and all its signups by ID."""
+    OTEvent.objects.filter(pk=event_id).delete()
 
 
 @sync_to_async
@@ -207,90 +221,128 @@ def _get_booked_days() -> set:
     return days
 
 
-# ── /newot flow ──────────────────────────────────────────────────────────────
+async def deadline_alert(context: ContextTypes.DEFAULT_TYPE):
+    """Job triggered when an OT event's deadline is reached."""
+    job = context.job
+    event_id = job.data
+    try:
+        event = await _get_event(event_id)
+        if not event or not event.is_open:
+            return
+
+        # Automated closure flow
+        await _close_signup_for_event(event, context)
+        logger.info(f"Auto-closed OT event {event_id} due to deadline.")
+        
+        # Notify admins that it auto-closed
+        await _ensure_admins_loaded()
+        all_admin_ids = set(list(settings.ADMIN_IDS) + list(_dynamic_admins))
+        for admin_id in all_admin_ids:
+            try:
+                await _tg_call(lambda: context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"⏰ *Deadline Reached*\n\nOT event *{_esc(event.title)}* has been automatically closed. Final list posted to group and CSV sent to your DM.",
+                    parse_mode=ParseMode.MARKDOWN,
+                ))
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"Deadline alert job failed for event {event_id}: {e}")
+
+
+@admin_only
+async def editot_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 1: Admin triggers /editot to modify an existing open event."""
+    events = await _get_open_events()
+    if not events:
+        await update.message.reply_text("There are no open OT events to edit.")
+        return ConversationHandler.END
+
+    if len(events) == 1:
+        event = events[0]
+        return await _init_edit_flow(update, context, event)
+
+    keyboard = select_event_keyboard(events, "edit_event")
+    await update.message.reply_text(
+        "Select the OT event you want to edit:",
+        reply_markup=keyboard,
+    )
+    return ASK_EDIT_SELECT
+
+
+ASK_EDIT_SELECT = 20
+
+
+async def edit_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        eid = int(query.data.split(":")[1])
+        event = await _get_event(eid)
+        if not event or not event.is_open:
+            await query.edit_message_text("This event is no longer open for editing.")
+            return ConversationHandler.END
+        return await _init_edit_flow(update, context, event)
+    except Exception:
+        await query.edit_message_text("Invalid selection.")
+        return ConversationHandler.END
+
+
+async def _init_edit_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, event):
+    context.user_data.clear()
+    context.user_data["edit_event_id"] = event.id
+    context.user_data["title"] = event.title
+    context.user_data["selected_days"] = list(event.days)
+    context.user_data["time_slots"] = event.time_slots.copy()
+    context.user_data["max_agents"] = event.max_agents
+    context.user_data["is_editing"] = True
+
+    msg = f"Editing OT: *{_esc(event.title)}*\n\nEnter the new title (or send /skip to keep current):"
+    if update.callback_query:
+        await update.callback_query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    return ASK_TITLE
+
 
 @admin_only
 async def newot_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 1: Admin triggers /newot. Block if an event is already open."""
-    open_events = await _get_open_events()
-    if open_events:
-        event = open_events[0]
-        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-        buttons = [
-            [InlineKeyboardButton(
-                f"Cancel & delete '{event.title}' first",
-                callback_data=f"cancelot_confirm:{event.id}"
-            )],
-            [InlineKeyboardButton("Never mind", callback_data="cancelot_abort")],
-        ]
-        await update.message.reply_text(
-            f"There is already an active OT event: *{_esc(event.title)}*\n\n"
-            "You must cancel or close it before creating a new one.",
-            reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return ConversationHandler.END
-
+    """Step 1: Admin triggers /newot.
+    Multiple OT events are allowed; we just start a fresh definition flow.
+    """
     context.user_data.clear()
-    context.user_data["selected_days"] = []
-    context.user_data["time_slots"] = {}
+    context.user_data["is_editing"] = False
     await update.message.reply_text(
-        "*New OT Event*\n\nEnter a title / description for this OT event:",
+        "Creating a new OT event.\n\nPlease enter the *title* for this OT (e.g. 'Monday Night Shift'):",
         parse_mode=ParseMode.MARKDOWN,
     )
     return ASK_TITLE
 
 
-@admin_only
-async def editot_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin triggers /editot to modify an active event's days and slots without cancelling it."""
-    open_events = await _get_open_events()
-    if not open_events:
-        await update.message.reply_text("There are no active OT events to edit right now.")
-        return ConversationHandler.END
-
-    event = open_events[0]
-    
-    context.user_data.clear()
-    context.user_data["edit_event_id"] = event.id
-    context.user_data["title"] = event.title
-    context.user_data["selected_days"] = list(event.days)
-    context.user_data["time_slots"] = event.time_slots if isinstance(event.time_slots, dict) else dict(event.time_slots)
-    context.user_data["max_agents"] = event.max_agents
-    
-    booked = await _get_booked_days()
-    for day in event.days:
-        booked.discard(day)
-    
-    from bot.utils import ALL_DAYS
-    available = [d for d in ALL_DAYS if d not in booked]
-    context.user_data["available_days"] = available
-    
-    await update.message.reply_text(
-        f"Editing OT Event: *{_esc(event.title)}*\n"
-        "Select the days for this OT event.\nTap a day to toggle it, then press Done.",
-        reply_markup=days_keyboard(context.user_data["selected_days"], available),
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    return ASK_DAYS
+# ── /newot flow ──────────────────────────────────────────────────────────────
 
 
 async def receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["title"] = update.message.text.strip()
-    # Filter out days already booked in another open event
-    booked = await _get_booked_days()
+    title = update.message.text.strip()
+    if not title:
+        await update.message.reply_text("Please enter a valid title.")
+        return ASK_TITLE
+    context.user_data["title"] = title
+
+    # Allow overlapping OT schedules across different shifts/groups.
     from bot.utils import ALL_DAYS
-    available = [d for d in ALL_DAYS if d not in booked]
+    available = list(ALL_DAYS)
     context.user_data["available_days"] = available
-    if not available:
-        await update.message.reply_text(
-            "All days are already scheduled in an active OT event. "
-            "Use /cancelot or /closesignup first."
-        )
-        return ConversationHandler.END
+
+    selected = context.user_data.get("selected_days")
+    if selected is None:
+        selected = []
+        context.user_data["selected_days"] = selected
+        context.user_data["time_slots"] = {}
+
     await update.message.reply_text(
         "Select the days for this OT event.\nTap a day to toggle it, then press Done.",
-        reply_markup=days_keyboard(context.user_data["selected_days"], available),
+        reply_markup=days_keyboard(selected, available),
         parse_mode=ParseMode.MARKDOWN,
     )
     return ASK_DAYS
@@ -306,9 +358,9 @@ async def toggle_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         selected.append(day)
     available = context.user_data.get("available_days")
-    await query.edit_message_reply_markup(
+    await _tg_call(lambda: query.edit_message_reply_markup(
         reply_markup=days_keyboard(selected, available)
-    )
+    ))
     return ASK_DAYS
 
 
@@ -367,7 +419,7 @@ async def toggle_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         selected.append(hours)
 
     kb = slot_keyboard_weekend(day, selected) if day in WEEKEND_DAYS else slot_keyboard_weekday(day, selected)
-    await query.edit_message_reply_markup(reply_markup=kb)
+    await _tg_call(lambda: query.edit_message_reply_markup(reply_markup=kb))
     return ASK_SLOTS
 
 
@@ -475,16 +527,16 @@ async def receive_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if edit_event_id:
         event = await _update_event(edit_event_id, title, days, time_slots, max_agents, deadline)
         announcement = format_announcement(event)
-        keyboard = announcement_keyboard(settings.BOT_USERNAME)
+        keyboard = announcement_keyboard(settings.BOT_USERNAME, event.id)
         if getattr(event, 'announcement_message_id', None):
             try:
-                await context.bot.edit_message_text(
+                await _tg_call(lambda: context.bot.edit_message_text(
                     chat_id=settings.GROUP_CHAT_ID,
                     message_id=event.announcement_message_id,
                     text=announcement,
                     parse_mode=ParseMode.MARKDOWN,
                     reply_markup=keyboard,
-                )
+                ))
             except Exception:
                 pass  # Message might be completely identical or deleted by an admin manually
                 
@@ -499,14 +551,14 @@ async def receive_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         event = await _create_event(title, uid, days, time_slots, max_agents, deadline)
         announcement = format_announcement(event)
-        keyboard = announcement_keyboard(settings.BOT_USERNAME)
+        keyboard = announcement_keyboard(settings.BOT_USERNAME, event.id)
 
-        msg = await context.bot.send_message(
+        msg = await _tg_call(lambda: context.bot.send_message(
             chat_id=settings.GROUP_CHAT_ID,
             text=announcement,
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=keyboard,
-        )
+        ))
         await _save_message_id(event, msg.message_id)
 
         # Schedule a deadline alert job if a deadline was set
@@ -550,9 +602,10 @@ def _get_event_with_signups(event_id: int):
 
 
 async def deadline_alert(context) -> None:
-    """PTB JobQueue job: fires at deadline, notifies all admins and lets them publish the final list."""
+    """PTB JobQueue job: fires at deadline, closes the OT, posts the list to
+    the group, and notifies all admins with the CSV."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    from bot.utils import format_signup_list, generate_csv, _esc, CLASS_TYPES
+    from bot.utils import format_signup_list, generate_csv, _esc
 
     job_data = context.job.data
     event_id = job_data["event_id"]
@@ -562,89 +615,59 @@ async def deadline_alert(context) -> None:
     except OTEvent.DoesNotExist:
         return  # Already deleted
 
-    signup_text = format_signup_list(event, signups)
-    csv_bytes = generate_csv(event, signups)
-    csv_filename = f"ot_{event.id}_{event.title.replace(' ', '_')[:30]}.csv"
+    try:
+        signup_text = format_signup_list(event, signups)
+        csv_bytes = generate_csv(event, signups)
+        csv_filename = f"ot_{event.id}_{event.title.replace(' ', '_')[:30]}.csv"
 
-    confirm_kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Post Final List to Group", callback_data=f"dl_post:{event.id}"),
-            InlineKeyboardButton("❌ Skip", callback_data=f"dl_skip:{event.id}"),
-        ]
-    ])
-
-    await _ensure_admins_loaded()
-    all_admin_ids = list(settings.ADMIN_IDS) + list(_dynamic_admins)
-
-    for admin_id in set(all_admin_ids):
+        # 1) Update the original announcement if possible
+        closed_text = signup_text + "\n\n_Signups are now CLOSED._"
+        final_notice = "📢 *OT CLOSED*\n\n" + closed_text
         try:
+            if event.announcement_message_id and event.group_chat_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=event.group_chat_id,
+                        message_id=event.announcement_message_id,
+                        text=closed_text,
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception:
+                    pass
+            # 2) Always send a separate closure notice to inform the group.
             await context.bot.send_message(
-                chat_id=admin_id,
-                text=(
-                    f"⏰ *OT Deadline Reached* — *{_esc(event.title)}* has been auto-closed.\n\n"
-                    f"{signup_text}\n\n"
-                    "Do you want to post the final signup list to the group?"
-                ),
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=confirm_kb,
-            )
-            await context.bot.send_document(
-                chat_id=admin_id,
-                document=BytesIO(csv_bytes),
-                filename=csv_filename,
-                caption=f"📊 Export for *{_esc(event.title)}*",
+                chat_id=settings.GROUP_CHAT_ID,
+                text=final_notice,
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception as exc:
-            logger.warning(f"Could not DM admin {admin_id}: {exc}")
+            logger.error(f"Failed to post auto-closure to group: {exc}")
 
+        # 2) Notify admins and send CSV
+        await _ensure_admins_loaded()
+        all_admin_ids = list(settings.ADMIN_IDS) + list(_dynamic_admins)
 
-async def deadline_post_confirm(update, context) -> None:
-    """Callback for the 'Post to Group' / 'Skip' inline buttons after a deadline alert."""
-    from bot.utils import format_signup_list, _esc
-    query = update.callback_query
-    await query.answer()
-
-    parts = query.data.split(":", 1)
-    action = parts[0]  # dl_post or dl_skip
-    event_id = int(parts[1])
-
-    if action == "dl_skip":
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text("Skipped — final list was NOT posted to the group.")
-        return
-
-    try:
-        event = await _get_event(event_id)
-        signups = await _get_signups(event)
-        signup_text = format_signup_list(event, signups)
-        closed_text = signup_text + "\n\n_Signups are now CLOSED._"
-
-        if event.announcement_message_id and event.group_chat_id:
+        for admin_id in set(all_admin_ids):
             try:
-                await context.bot.edit_message_text(
-                    chat_id=event.group_chat_id,
-                    message_id=event.announcement_message_id,
-                    text=closed_text,
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-            except Exception:
                 await context.bot.send_message(
-                    chat_id=settings.GROUP_CHAT_ID,
-                    text=closed_text,
+                    chat_id=admin_id,
+                    text=(
+                        f"⏰ *OT Deadline Reached* — *{_esc(event.title)}* has been auto-closed.\n\n"
+                        f"The final signup list has been posted to the group.\n"
+                    ),
                     parse_mode=ParseMode.MARKDOWN,
                 )
-        else:
-            await context.bot.send_message(
-                chat_id=settings.GROUP_CHAT_ID,
-                text=closed_text,
-                parse_mode=ParseMode.MARKDOWN,
-            )
-
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text(f"✅ Final list for *{_esc(event.title)}* has been posted to the group.", parse_mode=ParseMode.MARKDOWN)
+                await context.bot.send_document(
+                    chat_id=admin_id,
+                    document=BytesIO(csv_bytes),
+                    filename=csv_filename,
+                    caption=f"📊 Export for *{_esc(event.title)}*",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception as exc:
+                logger.warning(f"Could not DM admin {admin_id}: {exc}")
     except Exception as e:
-        await query.message.reply_text(f"Failed to post: {e}")
+        logger.error(f"Failed in deadline_alert: {e}")
 
 
 async def cancel_newot(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -728,56 +751,101 @@ async def cancel_event_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ── /closesignup flow ────────────────────────────────────────────────────────
 
+@admin_only
 async def close_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin closes the active OT event and gets the signup list for approval."""
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Admins only.")
-        return
-
+    """Admin selects one open OT event to close."""
     events = await _get_open_events()
     if not events:
         await update.message.reply_text("There are no open OT events right now.")
         return
 
-    # Close all open events (or adjust to handle multiple events if needed)
-    for event in events:
-        signups = await _get_signups(event)
-        await _close_event(event)
-        list_text = format_signup_list(event, signups)
-        approval_keyboard = approve_list_keyboard(event.id)
+    if len(events) == 1:
+        event = events[0]
+        await _close_signup_for_event(event, context)
         await update.message.reply_text(
-            f"Signup closed for *{_esc(event.title)}*.\n\n"
-            f"Review the list below and tap Approve to send it to the group:\n\n"
-            f"{list_text}",
-            reply_markup=approval_keyboard,
+            f"✅ *{_esc(event.title)}* has been closed. Results posted to group and CSV sent to admins.",
             parse_mode=ParseMode.MARKDOWN,
         )
+        return
+
+    keyboard = select_event_keyboard(events, "close_event")
+    await update.message.reply_text(
+        "Select which OT event to close:",
+        reply_markup=keyboard,
+    )
 
 
-async def approve_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin taps 'Approve & Send' – forwards signup list to group."""
+async def close_signup_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback handler for selecting a specific event to close."""
     query = update.callback_query
     await query.answer()
-
     if not is_admin(query.from_user.id):
         await query.answer("Not authorised.", show_alert=True)
         return
 
-    event_id = int(query.data.split(":", 1)[1])
-    event = await _get_event(event_id)
-    signups = await _get_signups(event)
-    list_text = format_signup_list(event, signups)
+    try:
+        event_id = int(query.data.split(":", 1)[1])
+        event = await _get_event(event_id)
+    except Exception:
+        await query.edit_message_text("Invalid event selection.")
+        return
 
-    await context.bot.send_message(
-        chat_id=settings.GROUP_CHAT_ID,
-        text=list_text,
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    if not event or not event.is_open:
+        await query.edit_message_text("This OT event is already closed.")
+        return
 
+    await _close_signup_for_event(event, context)
     await query.edit_message_text(
-        f"Signup list for *{_esc(event.title)}* has been sent to the group!",
+        f"✅ *{_esc(event.title)}* has been closed. Results posted to group and CSV sent to admins.",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+async def _close_signup_for_event(event, context):
+    """Close one OT event, post final list to group, DM CSV to admins."""
+    signups = await _get_signups(event)
+    await _close_event(event)
+
+    from bot.utils import format_signup_list, generate_csv, _esc
+    signup_text = format_signup_list(event, signups)
+    csv_bytes = generate_csv(event, signups)
+    csv_filename = f"ot_{event.id}_{event.title.replace(' ', '_')[:30]}.csv"
+
+    closed_text = signup_text + "\n\n_Signups are now CLOSED._"
+    final_notice = "📢 *OT CLOSED*\n\n" + closed_text
+    try:
+        if event.announcement_message_id and event.group_chat_id:
+            try:
+                await _tg_call(lambda: context.bot.edit_message_text(
+                    chat_id=event.group_chat_id,
+                    message_id=event.announcement_message_id,
+                    text=closed_text,
+                    parse_mode=ParseMode.MARKDOWN,
+                ))
+            except Exception:
+                pass
+        # Always send a separate closure notice to the group.
+        await _tg_call(lambda: context.bot.send_message(
+            chat_id=settings.GROUP_CHAT_ID,
+            text=final_notice,
+            parse_mode=ParseMode.MARKDOWN,
+        ))
+    except Exception as exc:
+        logger.error(f"Failed to post manual-closure to group: {exc}")
+
+    await _ensure_admins_loaded()
+    all_admin_ids = set(list(settings.ADMIN_IDS) + list(_dynamic_admins))
+    for admin_id in all_admin_ids:
+        try:
+            await _tg_call(lambda: context.bot.send_document(
+                chat_id=admin_id,
+                document=BytesIO(csv_bytes),
+                filename=csv_filename,
+                caption=f"📊 Export for *{_esc(event.title)}*",
+                parse_mode=ParseMode.MARKDOWN,
+            ))
+        except Exception as exc:
+            logger.warning(f"Could not DM admin {admin_id}: {exc}")
 
 
 # ── Extra Admin Commands ──────────────────────────────────────────────────────
@@ -1039,22 +1107,11 @@ async def export_ot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No open OT events to export.")
         return
 
+    from bot.utils import generate_csv
+
     for event in events:
         signups = await _get_signups(event)
-
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["Agent Name", "Day", "Hours", "Class", "Signed Up At (UTC)"])
-        for signup in signups:
-            writer.writerow([
-                signup.agent.agent_name,
-                signup.day,
-                float(signup.hours),
-                dict(CLASS_TYPES).get(signup.class_type, signup.class_type),
-                signup.confirmed_at.strftime("%Y-%m-%d %H:%M"),
-            ])
-
-        csv_bytes = output.getvalue().encode('utf-8')
+        csv_bytes = generate_csv(event, signups)
         filename = f"OT_{event.title.replace(' ', '_')}_{event.created_at.strftime('%Y%m%d')}.csv"
         bio = io.BytesIO(csv_bytes)
         bio.name = filename
@@ -1171,6 +1228,17 @@ async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
+async def cancel_newot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel the /newot or /editot flow."""
+    context.user_data.clear()
+    msg = "OT creation/edit cancelled."
+    if update.callback_query:
+        await update.callback_query.edit_message_text(msg)
+    else:
+        await update.message.reply_text(msg)
+    return ConversationHandler.END
+
+
 # ── ConversationHandler factory ───────────────────────────────────────────────
 
 def build_admin_conversation() -> ConversationHandler:
@@ -1180,6 +1248,7 @@ def build_admin_conversation() -> ConversationHandler:
             CommandHandler("editot", editot_start, filters=filters.ChatType.PRIVATE),
         ],
         states={
+            ASK_EDIT_SELECT: [CallbackQueryHandler(edit_select_callback, pattern=r"^edit_event:")],
             ASK_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_title)],
             ASK_DAYS: [
                 CallbackQueryHandler(toggle_day, pattern=r"^day_toggle:"),
