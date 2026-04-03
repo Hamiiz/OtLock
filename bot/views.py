@@ -5,6 +5,7 @@ import logging
 import asyncio
 import threading
 from datetime import datetime
+from asgiref.sync import sync_to_async
 
 from django.http import JsonResponse
 from django.shortcuts import render, redirect, get_object_or_404
@@ -14,6 +15,7 @@ from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.views.decorators.csrf import csrf_exempt
+from django.core.cache import cache
 
 from telegram import Bot, Update
 from telegram.constants import ParseMode
@@ -67,16 +69,24 @@ def dashboard_view(request):
     
     events = OTEvent.objects.filter(is_open=True).order_by('-created_at')
     past_events = OTEvent.objects.filter(is_open=False).order_by('-created_at')[:10]
+    active_signups = OTSignup.objects.filter(ot_event__is_open=True).count()
     
     return render(request, "bot/dashboard.html", {
         "events": events,
         "past_events": past_events,
+        "active_signups": active_signups,
     })
 
 
 @login_required
 def ot_create_view(request):
     if request.method == "POST":
+        # Server-side debounce/idempotency guard for accidental double-clicks.
+        lock_key = f"ot_create_lock:{request.user.id}"
+        if not cache.add(lock_key, True, timeout=8):
+            messages.warning(request, "Publish already in progress. Duplicate submit ignored.")
+            return redirect("dashboard")
+
         title = request.POST.get("title", "").strip()
         days = request.POST.getlist("days")
         max_agents_str = request.POST.get("max_agents", "").strip()
@@ -154,7 +164,7 @@ def ot_create_view(request):
         
         async def _send():
             bot_obj = Bot(token=settings.TELEGRAM_BOT_TOKEN)
-            keyboard = announcement_keyboard(settings.BOT_USERNAME)
+            keyboard = announcement_keyboard(settings.BOT_USERNAME, event.id)
             msg = await bot_obj.send_message(
                 chat_id=settings.GROUP_CHAT_ID,
                 text=announcement,
@@ -162,7 +172,7 @@ def ot_create_view(request):
                 reply_markup=keyboard,
             )
             event.announcement_message_id = msg.message_id
-            event.save()
+            await sync_to_async(event.save)()
             
         try:
             thread = threading.Thread(target=_run_async, args=(_send(),))
@@ -175,18 +185,12 @@ def ot_create_view(request):
         
         return redirect("dashboard")
         
-    # GET
+    # GET: allow reusing the same day across multiple OT events.
     from bot.utils import ALL_DAYS
-    # Check currently booked days
-    booked = set()
-    for e in OTEvent.objects.filter(is_open=True):
-        booked.update(e.days)
-        
-    available_days = [d for d in ALL_DAYS if d not in booked]
     
     return render(request, "bot/ot_form.html", {
         "is_edit": False,
-        "available_days": available_days,
+        "available_days": ALL_DAYS,
     })
 
 
@@ -204,7 +208,17 @@ def ot_close_view(request, pk):
     if request.method != "POST":
         return redirect("dashboard")
 
+    # Server-side debounce/idempotency guard for accidental double-clicks.
+    lock_key = f"ot_close_lock:{request.user.id}:{pk}"
+    if not cache.add(lock_key, True, timeout=8):
+        messages.warning(request, "Close already in progress. Duplicate submit ignored.")
+        return redirect("dashboard")
+
     event = get_object_or_404(OTEvent, pk=pk)
+    if not event.is_open:
+        messages.info(request, f"OT '{event.title}' is already closed.")
+        return redirect("dashboard")
+
     event.is_open = False
     event.save()
 
@@ -216,19 +230,9 @@ def ot_close_view(request, pk):
     )
     signup_text = format_signup_list(event, signups)
 
-    # Build CSV bytes
-    csv_buffer = io.StringIO()
-    writer = csv.writer(csv_buffer)
-    writer.writerow(["Agent", "Day", "Hours", "Class", "Confirmed At"])
-    for s in signups:
-        writer.writerow([
-            s.agent.agent_name,
-            s.day,
-            float(s.hours),
-            s.class_type,
-            s.confirmed_at.strftime("%Y-%m-%d %H:%M") if s.confirmed_at else "",
-        ])
-    csv_bytes = csv_buffer.getvalue().encode("utf-8")
+    # Build CSV bytes using the centralized utility
+    from bot.utils import generate_csv
+    csv_bytes = generate_csv(event, signups)
     csv_filename = f"ot_{event.id}_{event.title.replace(' ', '_')[:30]}.csv"
 
     def _run_async(coro):
@@ -241,12 +245,13 @@ def ot_close_view(request, pk):
     async def _broadcast_close():
         bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
 
-        # 1. Post final signup list to the group
+        # 1. Update original announcement (if possible) + always send separate close notice
         try:
+            closed_text = signup_text + "\n\n_Signups are now CLOSED._"
+            final_notice = "📢 *OT CLOSED*\n\n" + closed_text
             # Edit the original announcement to mark as closed
             if event.announcement_message_id and event.group_chat_id:
                 try:
-                    closed_text = signup_text + "\n\n_Signups are now CLOSED._"
                     await bot.edit_message_text(
                         chat_id=event.group_chat_id,
                         message_id=event.announcement_message_id,
@@ -254,18 +259,12 @@ def ot_close_view(request, pk):
                         parse_mode=ParseMode.MARKDOWN,
                     )
                 except Exception:
-                    # If edit fails (e.g. too old), send a fresh message
-                    await bot.send_message(
-                        chat_id=settings.GROUP_CHAT_ID,
-                        text=signup_text + "\n\n_Signups are now CLOSED._",
-                        parse_mode=ParseMode.MARKDOWN,
-                    )
-            else:
-                await bot.send_message(
-                    chat_id=settings.GROUP_CHAT_ID,
-                    text=signup_text + "\n\n_Signups are now CLOSED._",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
+                    pass
+            await bot.send_message(
+                chat_id=settings.GROUP_CHAT_ID,
+                text=final_notice,
+                parse_mode=ParseMode.MARKDOWN,
+            )
         except Exception as exc:
             logger.error(f"Failed to post closure to group: {exc}")
 

@@ -84,7 +84,7 @@
             </div>
 
             {% if available_days %}
-                <button type="submit" class="btn" style="width: 100%; padding: 1rem; font-size: 1.1rem; justify-content: center;" onclick="return confirm('Publish this OT event and send an announcement to the Telegram group?')">
+                <button type="submit" id="publish-btn" class="btn" style="width: 100%; padding: 1rem; font-size: 1.1rem; justify-content: center;">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" style="width: 20px; height: 20px;">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path>
                     </svg>
@@ -97,4 +97,18 @@
         </form>
     </div>
 </div>
+
+<script>
+document.querySelector('form').addEventListener('submit', function(e) {
+    if (!confirm('Publish this OT event and send an announcement to the Telegram group?')) {
+        e.preventDefault();
+        return;
+    }
+    const btn = document.getElementById('publish-btn');
+    btn.disabled = true;
+    btn.innerHTML = 'Publishing...';
+    btn.style.opacity = '0.5';
+    btn.style.cursor = 'not-allowed';
+});
+</script>
 {% endblock %}

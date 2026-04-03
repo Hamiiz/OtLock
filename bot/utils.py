@@ -149,16 +149,18 @@ def format_announcement(event) -> str:
     )
 
 
-def announcement_keyboard(bot_username: str) -> InlineKeyboardMarkup | None:
+def announcement_keyboard(bot_username: str, event_id: int) -> InlineKeyboardMarkup | None:
     """Return an inline keyboard with a Sign Up button linking to bot DM. Returns
     None if bot_username is not configured, so callers can skip reply_markup safely."""
     if not bot_username:
         return None
+    # Use Telegram deep-link with a payload so that opening the bot chat
+    # will immediately trigger /start with an argument.
     return InlineKeyboardMarkup(
         [[
             InlineKeyboardButton(
                 "📝 Sign Up Now",
-                url=f"https://t.me/{bot_username}"
+                url=f"https://t.me/{bot_username}?start=signup_{event_id}"
             )
         ]]
     )
@@ -199,45 +201,77 @@ def select_event_keyboard(events, callback_prefix: str) -> InlineKeyboardMarkup:
     """Generate a vertical list of buttons for selecting an active OT event."""
     buttons = []
     for event in events:
+        days_preview = ", ".join(event.days[:2]) if getattr(event, "days", None) else ""
+        if getattr(event, "days", None) and len(event.days) > 2:
+            days_preview += ", ..."
+        label = event.title
+        if days_preview:
+            label = f"{event.title} ({days_preview})"
+        if len(label) > 64:
+            label = label[:61] + "..."
         buttons.append([
             InlineKeyboardButton(
-                event.title, 
+                label,
                 callback_data=f"{callback_prefix}:{event.id}"
             )
         ])
     return InlineKeyboardMarkup(buttons)
 
 
-CLASS_TYPE_ORDER = ["DIALER", "IB", "TOPLIST"]
+CLASS_TYPE_ORDER = ["TOPLIST", "IB", "DIALER"]
 
 
 def generate_csv(event, signups) -> bytes:
-    """Generate a CSV export grouped by Class → Day, returned as UTF-8 bytes."""
+    """
+    Generate a CSV export with separate tables for each class type
+    (Toplist, IB, Dialer). Each table uses *days as columns* and
+    *agent names as rows*.
+    """
     import csv
     import io
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["Class", "Day", "Agent", "Hours", "Confirmed At"])
-    # Sort by class order, then by day index within the event, then by confirmed_at
-    day_order = {d: i for i, d in enumerate(event.days)}
-    class_order = {c: i for i, c in enumerate(CLASS_TYPE_ORDER)}
-    sorted_signups = sorted(
-        signups,
-        key=lambda s: (
-            class_order.get(s.class_type, 99),
-            day_order.get(s.day, 99),
-            s.confirmed_at or "",
-        )
-    )
+
+    # Pre-compute unique days and map for quick lookup
+    days = list(event.days or [])
+    day_indices = {day: idx for idx, day in enumerate(days)}
+
+    # Group signups by (class_type, agent_name)
+    from collections import defaultdict
+
     class_labels = dict(CLASS_TYPES)
-    for s in sorted_signups:
-        writer.writerow([
-            class_labels.get(s.class_type, s.class_type),
-            s.day,
-            s.agent.agent_name,
-            float(s.hours),
-            s.confirmed_at.strftime("%Y-%m-%d %H:%M") if s.confirmed_at else "",
-        ])
+    by_class_agent = defaultdict(lambda: defaultdict(dict))
+    # structure: by_class_agent[class_type][agent_name][day] = hours
+
+    for s in signups:
+        if s.day not in day_indices:
+            continue
+        cls = s.class_type
+        agent_name = s.agent.agent_name
+        by_class_agent[cls][agent_name][s.day] = float(s.hours)
+
+    # Write one table per class, in a stable order
+    for idx, cls_code in enumerate(CLASS_TYPE_ORDER):
+        agents = by_class_agent.get(cls_code)
+        if not agents:
+            continue
+
+        # Blank line between tables (except before the first written section)
+        if buf.tell() > 0:
+            writer.writerow([])
+
+        writer.writerow([class_labels.get(cls_code, cls_code)])
+        header = ["Agent Name"] + days
+        writer.writerow(header)
+
+        for agent_name in sorted(agents.keys()):
+            row = [agent_name]
+            per_day = agents[agent_name]
+            for day in days:
+                hrs = per_day.get(day)
+                row.append(hrs if hrs is not None else "")
+            writer.writerow(row)
+
     return buf.getvalue().encode("utf-8")
 
 
