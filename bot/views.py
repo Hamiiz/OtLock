@@ -15,13 +15,16 @@ from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
 from django.core.cache import cache
+from django.core.paginator import Paginator
+from django.db.models import Count
 
 from telegram import Bot, Update
 from telegram.constants import ParseMode
 
 from bot.bot_app import get_ptb_application
-from bot.models import OTEvent, OTSignup
+from bot.models import OTEvent, OTSignup, Agent
 from bot.utils import format_announcement, format_signup_list, announcement_keyboard, _esc
 
 logger = logging.getLogger(__name__)
@@ -63,10 +66,6 @@ telegram_webhook.csrf_exempt = True
 
 @login_required
 def dashboard_view(request):
-    now = timezone.now()
-    # Auto-close expired events safely before querying
-    OTEvent.objects.filter(is_open=True, deadline__lt=now).update(is_open=False)
-    
     events = OTEvent.objects.filter(is_open=True).order_by('-created_at')
     past_events = OTEvent.objects.filter(is_open=False).order_by('-created_at')[:10]
     active_signups = OTSignup.objects.filter(ot_event__is_open=True).count()
@@ -305,3 +304,80 @@ def ot_detail_view(request, pk):
     return render(request, "bot/ot_detail.html", {
         "event": event,
     })
+
+
+@login_required
+def user_management_view(request):
+    """List signups and agents; delete actions use separate POST endpoints."""
+    events = OTEvent.objects.order_by("-created_at")[:300]
+
+    signup_qs = (
+        OTSignup.objects.select_related("agent", "ot_event")
+        .order_by("-confirmed_at")
+    )
+    event_filter = request.GET.get("event", "").strip()
+    selected_event = ""
+    if event_filter.isdigit():
+        eid = int(event_filter)
+        signup_qs = signup_qs.filter(ot_event_id=eid)
+        selected_event = str(eid)
+
+    signup_page_no = request.GET.get("signups_page", 1)
+    signup_paginator = Paginator(signup_qs, 35)
+    signups_page = signup_paginator.get_page(signup_page_no)
+
+    agent_qs = Agent.objects.annotate(signup_count=Count("signups")).order_by("agent_name")
+    agent_page_no = request.GET.get("agents_page", 1)
+    agent_paginator = Paginator(agent_qs, 40)
+    agents_page = agent_paginator.get_page(agent_page_no)
+
+    return render(
+        request,
+        "bot/user_management.html",
+        {
+            "events": events,
+            "selected_event": selected_event,
+            "signups_page": signups_page,
+            "agents_page": agents_page,
+        },
+    )
+
+
+@login_required
+@require_POST
+def delete_signup_view(request, signup_id):
+    signup = get_object_or_404(
+        OTSignup.objects.select_related("agent", "ot_event"), pk=signup_id
+    )
+    label = (
+        f"{signup.agent.agent_name} — {signup.day} "
+        f"({signup.ot_event.title})"
+    )
+    signup.delete()
+    messages.success(request, f"Removed signup: {label}")
+    return redirect(_user_management_redirect_from_request(request))
+
+
+@login_required
+@require_POST
+def delete_agent_view(request, agent_id):
+    agent = get_object_or_404(Agent, pk=agent_id)
+    name = agent.agent_name
+    tid = agent.telegram_id
+    n = agent.signups.count()
+    agent.delete()
+    messages.success(
+        request,
+        f"Deleted agent “{name}” (Telegram {tid}) and {n} signup record(s).",
+    )
+    return redirect(_user_management_redirect_from_request(request))
+
+
+def _user_management_redirect_from_request(request):
+    """Preserve filters/pagination after POST (GET is empty on form POST)."""
+    posted = (request.POST.get("next_query") or "").strip()
+    if posted and "://" not in posted and not posted.startswith("//"):
+        return f"{reverse('user-management')}?{posted}"
+    q = request.GET.urlencode()
+    base = reverse("user-management")
+    return f"{base}?{q}" if q else base

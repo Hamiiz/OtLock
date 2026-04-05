@@ -1,0 +1,221 @@
+{% extends 'bot/layout.html' %}
+{% load tz %}
+
+{% block title %}Users - OT Management{% endblock %}
+
+{% block extra_css %}
+<style>
+    .um-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        flex-wrap: wrap;
+        gap: 1rem;
+        margin-bottom: 1.5rem;
+    }
+    .um-section {
+        margin-bottom: 2.5rem;
+    }
+    .um-section h3 {
+        margin-bottom: 0.75rem;
+    }
+    .um-table-wrap {
+        overflow-x: auto;
+    }
+    .um-table {
+        width: 100%;
+        border-collapse: collapse;
+        text-align: left;
+    }
+    .um-table th, .um-table td {
+        padding: 0.85rem 1rem;
+        border-bottom: 1px solid var(--glass-border);
+    }
+    .um-table th {
+        color: var(--text-muted);
+        font-size: 0.82rem;
+        font-weight: 600;
+        background: rgba(15, 23, 42, 0.35);
+    }
+    .um-table tr:hover td {
+        background: rgba(59, 130, 246, 0.04);
+    }
+    .um-muted { color: var(--text-muted); font-size: 0.85rem; }
+    .um-filter {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        align-items: center;
+    }
+    .pagination {
+        display: flex;
+        gap: 0.5rem;
+        align-items: center;
+        margin-top: 1rem;
+        flex-wrap: wrap;
+    }
+    .pagination a, .pagination span {
+        padding: 0.35rem 0.65rem;
+        border-radius: 6px;
+        text-decoration: none;
+        font-size: 0.88rem;
+    }
+    .pagination a {
+        background: var(--surface);
+        border: 1px solid var(--glass-border);
+        color: var(--text-main);
+    }
+    .pagination a:hover {
+        border-color: var(--primary);
+    }
+    .pagination .current {
+        color: var(--text-muted);
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="um-header">
+    <div>
+        <h2 style="margin: 0;">User management</h2>
+        <p class="um-muted" style="margin-top: 0.35rem;">Remove individual signups or delete an agent entirely (all their signups are removed).</p>
+    </div>
+</div>
+
+<section class="um-section glass-card" style="padding: 1.5rem;">
+    <h3 style="margin-top: 0;">Signups</h3>
+    <form method="get" class="um-filter" style="margin-bottom: 1rem;">
+        <label class="form-label" style="margin: 0;">Filter by OT</label>
+        <select name="event" class="form-control" style="width: auto; min-width: 220px;" onchange="this.form.submit()">
+            <option value="">All events</option>
+            {% for ev in events %}
+            <option value="{{ ev.pk }}"{% if selected_event == ev.pk|stringformat:"s" %} selected{% endif %}>
+                {{ ev.title }}{% if ev.is_open %} (active){% else %} (closed){% endif %}
+            </option>
+            {% endfor %}
+        </select>
+    </form>
+
+    {% if signups_page.object_list %}
+    <div class="um-table-wrap">
+        <table class="um-table">
+            <thead>
+                <tr>
+                    <th>OT event</th>
+                    <th>Agent</th>
+                    <th>Day</th>
+                    <th>Hours</th>
+                    <th>Class</th>
+                    <th>Signed up</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for s in signups_page %}
+                <tr>
+                    <td>
+                        <strong>{{ s.ot_event.title }}</strong>
+                        <div class="um-muted">{% if s.ot_event.is_open %}Open{% else %}Closed{% endif %}</div>
+                    </td>
+                    <td>
+                        {{ s.agent.agent_name }}
+                        <div class="um-muted">TG {{ s.agent.telegram_id }}{% if s.agent.telegram_username %} · @{{ s.agent.telegram_username }}{% endif %}</div>
+                    </td>
+                    <td>{{ s.day }}</td>
+                    <td>{{ s.hours|floatformat:1 }}</td>
+                    <td>{{ s.get_class_type_display }}</td>
+                    <td class="um-muted">{{ s.confirmed_at|localtime|date:"d M Y H:i" }}</td>
+                    <td>
+                        <form method="post" action="{% url 'signup-delete' s.pk %}" class="js-confirm-delete-signup" style="display:inline;">
+                            {% csrf_token %}
+                            <input type="hidden" name="next_query" value="{{ request.GET.urlencode }}">
+                            <button type="submit" class="btn danger" style="padding: 0.35rem 0.65rem; font-size: 0.8rem;">Remove signup</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% if signups_page.has_other_pages %}
+    <div class="pagination">
+        {% if signups_page.has_previous %}
+        <a href="?{% if selected_event %}event={{ selected_event }}&{% endif %}signups_page={{ signups_page.previous_page_number }}{% if agents_page.number != 1 %}&agents_page={{ agents_page.number }}{% endif %}">← Newer</a>
+        {% endif %}
+        <span class="current">Page {{ signups_page.number }} of {{ signups_page.paginator.num_pages }}</span>
+        {% if signups_page.has_next %}
+        <a href="?{% if selected_event %}event={{ selected_event }}&{% endif %}signups_page={{ signups_page.next_page_number }}{% if agents_page.number != 1 %}&agents_page={{ agents_page.number }}{% endif %}">Older →</a>
+        {% endif %}
+    </div>
+    {% endif %}
+    {% else %}
+    <p class="um-muted">No signups match this filter.</p>
+    {% endif %}
+</section>
+
+<section class="um-section glass-card" style="padding: 1.5rem;">
+    <h3 style="margin-top: 0;">Agents</h3>
+    <p class="um-muted" style="margin-bottom: 1rem;">Deleting an agent removes their Telegram link and <strong>every</strong> signup row for them across all OTs. Use “Remove signup” above if you only need to drop one day.</p>
+
+    {% if agents_page.object_list %}
+    <div class="um-table-wrap">
+        <table class="um-table">
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Telegram</th>
+                    <th>Signups</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for a in agents_page %}
+                <tr>
+                    <td><strong>{{ a.agent_name }}</strong></td>
+                    <td class="um-muted">{{ a.telegram_id }}{% if a.telegram_username %} · @{{ a.telegram_username }}{% endif %}</td>
+                    <td>{{ a.signup_count }}</td>
+                    <td>
+                        <form method="post" action="{% url 'agent-delete' a.pk %}" class="js-confirm-delete-agent" style="display:inline;">
+                            {% csrf_token %}
+                            <input type="hidden" name="next_query" value="{{ request.GET.urlencode }}">
+                            <button type="submit" class="btn danger" style="padding: 0.35rem 0.65rem; font-size: 0.8rem;">Delete agent</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% if agents_page.has_other_pages %}
+    <div class="pagination">
+        {% if agents_page.has_previous %}
+        <a href="?{% if selected_event %}event={{ selected_event }}&{% endif %}{% if signups_page.number != 1 %}signups_page={{ signups_page.number }}&{% endif %}agents_page={{ agents_page.previous_page_number }}">← Previous</a>
+        {% endif %}
+        <span class="current">Page {{ agents_page.number }} of {{ agents_page.paginator.num_pages }}</span>
+        {% if agents_page.has_next %}
+        <a href="?{% if selected_event %}event={{ selected_event }}&{% endif %}{% if signups_page.number != 1 %}signups_page={{ signups_page.number }}&{% endif %}agents_page={{ agents_page.next_page_number }}">Next →</a>
+        {% endif %}
+    </div>
+    {% endif %}
+    {% else %}
+    <p class="um-muted">No agents in the database yet.</p>
+    {% endif %}
+</section>
+
+<script>
+document.querySelectorAll('.js-confirm-delete-signup').forEach(function(form) {
+    form.addEventListener('submit', function(e) {
+        if (!confirm('Remove this signup only? The agent can sign up again for that day if the OT is still open.')) {
+            e.preventDefault();
+        }
+    });
+});
+document.querySelectorAll('.js-confirm-delete-agent').forEach(function(form) {
+    form.addEventListener('submit', function(e) {
+        if (!confirm('Delete this agent and all of their signups on every OT (or zero if none)? This cannot be undone.')) {
+            e.preventDefault();
+        }
+    });
+});
+</script>
+{% endblock %}

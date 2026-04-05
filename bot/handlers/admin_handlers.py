@@ -37,6 +37,7 @@ from telegram.constants import ParseMode
 from telegram.error import TimedOut, NetworkError
 
 from django.conf import settings
+from django.core.cache import cache
 from django.utils import timezone
 from bot.models import OTEvent, OTSignup
 from bot.utils import (
@@ -145,9 +146,7 @@ def _update_event(event_id, title, days, time_slots, max_agents, deadline):
 
 @sync_to_async
 def _get_open_events():
-    now = timezone.now()
-    # Auto-close any events whose deadline has passed
-    OTEvent.objects.filter(is_open=True, deadline__lt=now).update(is_open=False)
+    """Open OT events only. Do not silently flip is_open here — deadline/capacity flows notify admins first."""
     return list(OTEvent.objects.filter(is_open=True).order_by("-created_at"))
 
 
@@ -221,33 +220,216 @@ def _get_booked_days() -> set:
     return days
 
 
-async def deadline_alert(context: ContextTypes.DEFAULT_TYPE):
-    """Job triggered when an OT event's deadline is reached."""
-    job = context.job
-    event_id = job.data
-    try:
-        event = await _get_event(event_id)
-        if not event or not event.is_open:
-            return
+# ── Admin approval before posting final list (deadline / capacity) ───────────
 
-        # Automated closure flow
-        await _close_signup_for_event(event, context)
-        logger.info(f"Auto-closed OT event {event_id} due to deadline.")
-        
-        # Notify admins that it auto-closed
-        await _ensure_admins_loaded()
-        all_admin_ids = set(list(settings.ADMIN_IDS) + list(_dynamic_admins))
-        for admin_id in all_admin_ids:
+def _closure_prompt_cache_key(reason: str, event_id: int) -> str:
+    return f"ot_admin_closure_prompt:{reason}:{event_id}"
+
+
+def _group_posted_cache_key(event_id: int) -> str:
+    return f"ot_group_closure_posted:{event_id}"
+
+
+@sync_to_async
+def _close_event_if_still_open(event_id: int) -> bool:
+    """Return True if we closed an open event, False if already closed/missing."""
+    updated = OTEvent.objects.filter(pk=event_id, is_open=True).update(is_open=False)
+    return updated > 0
+
+
+async def _post_closure_announcements_to_group(bot, event) -> None:
+    """Edit original announcement (if possible) and send separate OT CLOSED notice."""
+    from bot.utils import format_signup_list
+
+    signups = await _get_signups(event)
+    signup_text = format_signup_list(event, signups)
+    closed_text = signup_text + "\n\n_Signups are now CLOSED._"
+    final_notice = "📢 *OT CLOSED*\n\n" + closed_text
+    try:
+        if event.announcement_message_id and event.group_chat_id:
             try:
-                await _tg_call(lambda: context.bot.send_message(
-                    chat_id=admin_id,
-                    text=f"⏰ *Deadline Reached*\n\nOT event *{_esc(event.title)}* has been automatically closed. Final list posted to group and CSV sent to your DM.",
-                    parse_mode=ParseMode.MARKDOWN,
-                ))
+                await _tg_call(
+                    lambda: bot.edit_message_text(
+                        chat_id=event.group_chat_id,
+                        message_id=event.announcement_message_id,
+                        text=closed_text,
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                )
             except Exception:
                 pass
+        await _tg_call(
+            lambda: bot.send_message(
+                chat_id=settings.GROUP_CHAT_ID,
+                text=final_notice,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        )
+    except Exception as exc:
+        logger.error(f"Failed to post closure to group for event {event.id}: {exc}")
+
+
+async def begin_ot_closure_with_admin_approval(bot, event_id: int, reason: str) -> None:
+    """
+    Close signups for this OT, then DM all admins with list + CSV + approve/skip buttons.
+    reason: 'deadline' | 'capacity'
+    Idempotent per (reason, event_id) via cache.
+    """
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    from bot.utils import format_signup_list, generate_csv
+
+    ck = _closure_prompt_cache_key(reason, event_id)
+    if not cache.add(ck, reason, timeout=86400 * 30):
+        return
+
+    closed = await _close_event_if_still_open(event_id)
+    if not closed:
+        cache.delete(ck)
+        return
+
+    event = await _get_event(event_id)
+    if not event:
+        cache.delete(ck)
+        return
+
+    signups = await _get_signups(event)
+    signup_text = format_signup_list(event, signups)
+    csv_bytes = generate_csv(event, signups)
+    csv_filename = f"ot_{event.id}_{event.title.replace(' ', '_')[:30]}.csv"
+
+    if reason == "deadline":
+        title_line = "⏰ *Signup deadline reached*"
+        detail = "Signups are now *closed* for this OT. Review the list and CSV, then post the final list to the group when ready."
+    else:
+        title_line = "🎯 *Signup limit reached*"
+        detail = "This OT has reached its maximum number of signups. Review the list and CSV, then post the final list to the group when ready."
+
+    confirm_kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Post final list to group",
+                    callback_data=f"approve_closure:{event_id}",
+                ),
+                InlineKeyboardButton(
+                    "Skip (I'll handle it)",
+                    callback_data=f"skip_closure:{event_id}",
+                ),
+            ]
+        ]
+    )
+
+    await _ensure_admins_loaded()
+    all_admin_ids = set(list(settings.ADMIN_IDS) + list(_dynamic_admins))
+
+    for admin_id in all_admin_ids:
+        try:
+
+            async def _send_prompt(aid=admin_id):
+                return await bot.send_message(
+                    chat_id=aid,
+                    text=(
+                        f"{title_line}\n\n"
+                        f"*{_esc(event.title)}*\n\n"
+                        f"{detail}\n\n"
+                        f"{signup_text}"
+                    ),
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=confirm_kb,
+                )
+
+            await _tg_call(_send_prompt)
+
+            async def _send_csv(aid=admin_id):
+                return await bot.send_document(
+                    chat_id=aid,
+                    document=BytesIO(csv_bytes),
+                    filename=csv_filename,
+                    caption=f"📊 Export — *{_esc(event.title)}*",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+
+            await _tg_call(_send_csv)
+        except Exception as exc:
+            logger.warning(f"Could not DM admin {admin_id} closure prompt: {exc}")
+
+    logger.info(f"OT {event_id} closed ({reason}); admin approval prompt sent.")
+
+
+async def approve_closure_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.answer("Not authorised.", show_alert=True)
+        return
+
+    try:
+        event_id = int(query.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await query.edit_message_text("Invalid selection.")
+        return
+
+    posted_key = _group_posted_cache_key(event_id)
+    if not cache.add(posted_key, "1", timeout=86400 * 30):
+        await query.edit_message_text("Final list was already posted to the group.")
+        return
+
+    event = await _get_event(event_id)
+    if not event:
+        cache.delete(posted_key)
+        await query.edit_message_text("This OT event no longer exists.")
+        return
+
+    await _post_closure_announcements_to_group(context.bot, event)
+
+    await query.edit_message_text(
+        f"✅ Final list for *{_esc(event.title)}* has been posted to the group.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def skip_closure_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.answer("Not authorised.", show_alert=True)
+        return
+
+    try:
+        event_id = int(query.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await query.edit_message_text("Invalid selection.")
+        return
+
+    event = await _get_event(event_id)
+    title = _esc(event.title) if event else "this OT"
+    await query.edit_message_text(
+        f"Skipped posting for *{title}*.\n\n"
+        "Signups are already closed. You can share the CSV manually or ask another admin to post.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def scan_overdue_deadlines_on_startup(application) -> None:
+    """If the bot was down when a deadline passed, notify admins once per event."""
+    now = timezone.now()
+
+    @sync_to_async
+    def _overdue_ids():
+        return list(
+            OTEvent.objects.filter(
+                is_open=True,
+                deadline__isnull=False,
+                deadline__lt=now,
+            ).values_list("id", flat=True)
+        )
+
+    try:
+        ids = await _overdue_ids()
+        for eid in ids:
+            await begin_ot_closure_with_admin_approval(application.bot, eid, "deadline")
     except Exception as e:
-        logger.error(f"Deadline alert job failed for event {event_id}: {e}")
+        logger.error(f"Overdue deadline scan failed: {e}")
 
 
 @admin_only
@@ -586,88 +768,15 @@ async def receive_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Deadline alert job ────────────────────────────────────────────────────────
 
-@sync_to_async
-def _get_event_with_signups(event_id: int):
-    from bot.models import OTSignup
-    event = OTEvent.objects.get(pk=event_id)
-    signups = list(
-        OTSignup.objects.filter(ot_event=event)
-        .select_related("agent")
-        .order_by("day", "confirmed_at")
-    )
-    # Close the event now
-    event.is_open = False
-    event.save()
-    return event, signups
-
 
 async def deadline_alert(context) -> None:
-    """PTB JobQueue job: fires at deadline, closes the OT, posts the list to
-    the group, and notifies all admins with the CSV."""
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    from bot.utils import format_signup_list, generate_csv, _esc
-
+    """JobQueue: fires at deadline — close signups, DM admins list + CSV + post approval."""
     job_data = context.job.data
     event_id = job_data["event_id"]
-
     try:
-        event, signups = await _get_event_with_signups(event_id)
-    except OTEvent.DoesNotExist:
-        return  # Already deleted
-
-    try:
-        signup_text = format_signup_list(event, signups)
-        csv_bytes = generate_csv(event, signups)
-        csv_filename = f"ot_{event.id}_{event.title.replace(' ', '_')[:30]}.csv"
-
-        # 1) Update the original announcement if possible
-        closed_text = signup_text + "\n\n_Signups are now CLOSED._"
-        final_notice = "📢 *OT CLOSED*\n\n" + closed_text
-        try:
-            if event.announcement_message_id and event.group_chat_id:
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=event.group_chat_id,
-                        message_id=event.announcement_message_id,
-                        text=closed_text,
-                        parse_mode=ParseMode.MARKDOWN,
-                    )
-                except Exception:
-                    pass
-            # 2) Always send a separate closure notice to inform the group.
-            await context.bot.send_message(
-                chat_id=settings.GROUP_CHAT_ID,
-                text=final_notice,
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception as exc:
-            logger.error(f"Failed to post auto-closure to group: {exc}")
-
-        # 2) Notify admins and send CSV
-        await _ensure_admins_loaded()
-        all_admin_ids = list(settings.ADMIN_IDS) + list(_dynamic_admins)
-
-        for admin_id in set(all_admin_ids):
-            try:
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=(
-                        f"⏰ *OT Deadline Reached* — *{_esc(event.title)}* has been auto-closed.\n\n"
-                        f"The final signup list has been posted to the group.\n"
-                    ),
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-                await context.bot.send_document(
-                    chat_id=admin_id,
-                    document=BytesIO(csv_bytes),
-                    filename=csv_filename,
-                    caption=f"📊 Export for *{_esc(event.title)}*",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-            except Exception as exc:
-                logger.warning(f"Could not DM admin {admin_id}: {exc}")
+        await begin_ot_closure_with_admin_approval(context.bot, event_id, "deadline")
     except Exception as e:
-        logger.error(f"Failed in deadline_alert: {e}")
+        logger.error(f"Failed in deadline_alert for event {event_id}: {e}")
 
 
 async def cancel_newot(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -806,44 +915,27 @@ async def _close_signup_for_event(event, context):
     signups = await _get_signups(event)
     await _close_event(event)
 
-    from bot.utils import format_signup_list, generate_csv, _esc
-    signup_text = format_signup_list(event, signups)
+    from bot.utils import generate_csv, _esc
     csv_bytes = generate_csv(event, signups)
     csv_filename = f"ot_{event.id}_{event.title.replace(' ', '_')[:30]}.csv"
 
-    closed_text = signup_text + "\n\n_Signups are now CLOSED._"
-    final_notice = "📢 *OT CLOSED*\n\n" + closed_text
-    try:
-        if event.announcement_message_id and event.group_chat_id:
-            try:
-                await _tg_call(lambda: context.bot.edit_message_text(
-                    chat_id=event.group_chat_id,
-                    message_id=event.announcement_message_id,
-                    text=closed_text,
-                    parse_mode=ParseMode.MARKDOWN,
-                ))
-            except Exception:
-                pass
-        # Always send a separate closure notice to the group.
-        await _tg_call(lambda: context.bot.send_message(
-            chat_id=settings.GROUP_CHAT_ID,
-            text=final_notice,
-            parse_mode=ParseMode.MARKDOWN,
-        ))
-    except Exception as exc:
-        logger.error(f"Failed to post manual-closure to group: {exc}")
+    await _post_closure_announcements_to_group(context.bot, event)
 
     await _ensure_admins_loaded()
     all_admin_ids = set(list(settings.ADMIN_IDS) + list(_dynamic_admins))
     for admin_id in all_admin_ids:
         try:
-            await _tg_call(lambda: context.bot.send_document(
-                chat_id=admin_id,
-                document=BytesIO(csv_bytes),
-                filename=csv_filename,
-                caption=f"📊 Export for *{_esc(event.title)}*",
-                parse_mode=ParseMode.MARKDOWN,
-            ))
+
+            async def _send_export(aid=admin_id):
+                return await context.bot.send_document(
+                    chat_id=aid,
+                    document=BytesIO(csv_bytes),
+                    filename=csv_filename,
+                    caption=f"📊 Export for *{_esc(event.title)}*",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+
+            await _tg_call(_send_export)
         except Exception as exc:
             logger.warning(f"Could not DM admin {admin_id}: {exc}")
 
@@ -1270,6 +1362,8 @@ def build_admin_conversation() -> ConversationHandler:
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel_newot)],
+        # Without this, /newot and /editot are ignored mid-flow (entry points only run when state is None).
+        allow_reentry=True,
         per_user=True,
         per_chat=True,
         per_message=False,
