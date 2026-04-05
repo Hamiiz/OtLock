@@ -230,6 +230,37 @@
         }
 
         .text-center { text-align: center; }
+
+        .dash-tabs {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin-bottom: 1.5rem;
+            padding-bottom: 0.75rem;
+            border-bottom: 1px solid var(--glass-border);
+        }
+
+        .dash-tab {
+            padding: 0.45rem 1rem;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 0.9rem;
+            text-decoration: none;
+            color: var(--text-muted);
+            border: 1px solid transparent;
+            transition: color 0.2s, background 0.2s, border-color 0.2s;
+        }
+
+        .dash-tab:hover {
+            color: var(--text-main);
+            background: rgba(148, 163, 184, 0.1);
+        }
+
+        .dash-tab.active {
+            color: var(--text-main);
+            background: rgba(59, 130, 246, 0.15);
+            border-color: rgba(59, 130, 246, 0.35);
+        }
         
         .mt-1 { margin-top: 1rem; }
         .mt-2 { margin-top: 2rem; }
@@ -253,6 +284,12 @@
     </nav>
 
     <div class="container">
+        {% if user.is_authenticated %}
+        <nav class="dash-tabs" aria-label="Dashboard sections">
+            <a href="{% url 'dashboard' %}" class="dash-tab{% if request.resolver_match.url_name == 'dashboard' %} active{% endif %}">Dashboard</a>
+            <a href="{% url 'user-management' %}" class="dash-tab{% if request.resolver_match.url_name == 'user-management' %} active{% endif %}">Users</a>
+        </nav>
+        {% endif %}
         {% if messages %}
             <ul class="messages">
                 {% for message in messages %}

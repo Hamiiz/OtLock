@@ -63,6 +63,13 @@ def _get_agent(telegram_id):
 
 
 @sync_to_async
+def _agent_by_pk(pk):
+    if not pk:
+        return None
+    return Agent.objects.filter(pk=pk).first()
+
+
+@sync_to_async
 def _get_open_events():
     """Return all currently open OT events."""
     return list(OTEvent.objects.filter(is_open=True).order_by("-created_at"))
@@ -74,6 +81,14 @@ def _get_event(event_id):
         return OTEvent.objects.get(pk=event_id, is_open=True)
     except OTEvent.DoesNotExist:
         return None
+
+
+@sync_to_async
+def _get_event_row_by_pk(event_id):
+    """Return OT row if it exists (open or closed). None if deleted."""
+    if not event_id:
+        return None
+    return OTEvent.objects.filter(pk=event_id).first()
 
 
 @sync_to_async
@@ -101,7 +116,12 @@ def _create_signup(agent, event, day, hours, class_type):
     with transaction.atomic():
         # Re-fetch the event with a row-level lock to prevent race conditions
         # on max_agents when two users confirm at the same moment.
-        ev = OTEvent.objects.select_for_update().get(pk=event.pk)
+        try:
+            ev = OTEvent.objects.select_for_update().get(pk=event.pk)
+        except OTEvent.DoesNotExist:
+            return None, "gone"
+        if not ev.is_open:
+            return None, "closed"
         # Enforce one-open-OT-per-user rule at commit time as well.
         # This closes race windows between /start and final confirmation.
         has_other_open = OTSignup.objects.filter(
@@ -124,6 +144,33 @@ def _create_signup(agent, event, day, hours, class_type):
 @sync_to_async
 def _event_is_full(event):
     return event.is_full()
+
+
+async def _end_signup_session(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    use_edit: bool = True,
+) -> int:
+    """Clear signup state and end conversation without crashing other handlers."""
+    context.user_data.clear()
+    try:
+        if query and use_edit:
+            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+        elif query and query.message:
+            await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        try:
+            if query and query.message:
+                await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
+    return ConversationHandler.END
+
+
+def _signup_state_ok(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return bool(context.user_data.get("event_id"))
 
 
 # ── Handlers ─────────────────────────────────────────────────────────────────
@@ -201,18 +248,33 @@ async def select_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
         event_id = int(data.split(":")[1])
         event = await _get_event(event_id)
         if not event:
-            await query.edit_message_text("This OT event is no longer active.")
+            context.user_data.clear()
+            try:
+                await query.edit_message_text("This OT event is no longer active.")
+            except Exception:
+                pass
             return ConversationHandler.END
-        
+
         if await _event_is_full(event):
-            await query.edit_message_text(f"The OT signup for *{_esc(event.title)}* is currently full.", parse_mode=ParseMode.MARKDOWN)
+            context.user_data.clear()
+            try:
+                await query.edit_message_text(
+                    f"The OT signup for *{_esc(event.title)}* is currently full.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
             return ConversationHandler.END
 
         context.user_data["event_id"] = event.id
         # We need to manually call the next step because start() logic didn't finish
         return await _start_signup_flow(update, context, event)
     except (IndexError, ValueError):
-        await query.edit_message_text("Invalid selection.")
+        context.user_data.clear()
+        try:
+            await query.edit_message_text("Invalid selection.")
+        except Exception:
+            pass
         return ConversationHandler.END
 
 
@@ -277,12 +339,19 @@ async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please enter a valid name.")
         return _ASK_NAME
 
+    event_days = context.user_data.get("event_days")
+    if not event_days:
+        await update.message.reply_text(
+            "Your session expired or this chat was reset. Please tap *Sign Up* on the latest OT announcement or send /start.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
     context.user_data["agent_name"] = agent_name
     user = update.effective_user
     agent = await _get_or_create_agent(user.id, user.username or "", agent_name)
     context.user_data["agent_id"] = agent.pk
-
-    event_days = context.user_data["event_days"]
     await update.message.reply_text(
         f"Name saved: *{_esc(agent_name)}*\n\n"
         "Select the days you want to work OT.\n"
@@ -296,21 +365,43 @@ async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def toggle_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if not _signup_state_ok(context) or "event_days" not in context.user_data:
+        return await _end_signup_session(
+            query,
+            context,
+            "This signup session is no longer valid (it may have expired). Please send /start again.",
+        )
     day = query.data.split(":", 1)[1]
-    selected = context.user_data["selected_days"]
+    selected = context.user_data.setdefault("selected_days", [])
+    event_days = context.user_data.get("event_days") or []
     if day in selected:
         selected.remove(day)
     else:
         selected.append(day)
-    await query.edit_message_reply_markup(
-        reply_markup=user_day_multi_keyboard(context.user_data["event_days"], selected)
-    )
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=user_day_multi_keyboard(event_days, selected)
+        )
+    except Exception:
+        await query.message.reply_text(
+            "Could not update that message. Please send /start to sign up again.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
     return PICK_DAYS
 
 
 async def days_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    selected = context.user_data["selected_days"]
+    if not _signup_state_ok(context) or "event_days" not in context.user_data:
+        await query.answer()
+        return await _end_signup_session(
+            query,
+            context,
+            "This signup session is no longer valid. Please send /start again.",
+        )
+    selected = context.user_data.get("selected_days") or []
     if not selected:
         await query.answer("Please select at least one day!", show_alert=True)
         return PICK_DAYS
@@ -323,7 +414,7 @@ async def days_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _ask_next_hours(query_or_msg, context: ContextTypes.DEFAULT_TYPE):
     """Ask for hours for the next pending day."""
-    pending = context.user_data["pending_days"]
+    pending = context.user_data.get("pending_days") or []
     if not pending:
         # All days done – move to class selection
         return await _ask_class(query_or_msg, context)
@@ -331,56 +422,123 @@ async def _ask_next_hours(query_or_msg, context: ContextTypes.DEFAULT_TYPE):
     day = pending[0]
     context.user_data["current_hours_day"] = day
 
-    # Reload event to get current time_slots
-    from bot.models import OTEvent
-    event = await sync_to_async(OTEvent.objects.get)(pk=context.user_data["event_id"])
-    slots = [float(s) for s in event.time_slots.get(day, [])]
+    eid = context.user_data.get("event_id")
+    event = await _get_event_row_by_pk(eid)
+    if event is None:
+        return await _end_signup_session(
+            query_or_msg if hasattr(query_or_msg, "answer") else None,
+            context,
+            "This OT event is no longer available. Please send /start when a new signup opens.",
+        )
+    if not event.is_open:
+        return await _end_signup_session(
+            query_or_msg if hasattr(query_or_msg, "answer") else None,
+            context,
+            "This OT signup has *closed* while you were selecting options.\n\nSend /start when a new OT is announced.",
+        )
+
+    slots = [float(s) for s in (event.time_slots or {}).get(day, [])]
 
     if not slots:
-        await query_or_msg.edit_message_text(
-            f"No time slots configured for *{day}*. Skipping.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        context.user_data["pending_days"].pop(0)
+        try:
+            await query_or_msg.edit_message_text(
+                f"No time slots configured for *{day}*. Skipping.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+        pd = context.user_data.get("pending_days")
+        if isinstance(pd, list) and pd:
+            pd.pop(0)
         return await _ask_next_hours(query_or_msg, context)
 
-    await query_or_msg.edit_message_text(
-        f"*{day}* — how many hours will you work?",
-        reply_markup=user_hour_keyboard(day, slots),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    try:
+        await query_or_msg.edit_message_text(
+            f"*{day}* — how many hours will you work?",
+            reply_markup=user_hour_keyboard(day, slots),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception:
+        context.user_data.clear()
+        try:
+            await query_or_msg.message.reply_text(
+                "Could not continue on this message. Please send /start to sign up again.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+        return ConversationHandler.END
     return PICK_HOURS
 
 
 async def pick_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    hours = float(query.data.split(":", 1)[1])
-    day = context.user_data["current_hours_day"]
-    context.user_data["day_hours"][day] = hours
+    if not _signup_state_ok(context):
+        return await _end_signup_session(
+            query,
+            context,
+            "Session expired. Please send /start again.",
+        )
+    pending = context.user_data.get("pending_days")
+    day = context.user_data.get("current_hours_day")
+    if pending is None or day is None:
+        return await _end_signup_session(
+            query,
+            context,
+            "This step is out of date. Please send /start again.",
+        )
+    try:
+        hours = float(query.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        return await _end_signup_session(query, context, "Invalid selection. Please send /start again.")
+    context.user_data.setdefault("day_hours", {})[day] = hours
     context.user_data["pending_days"].pop(0)
     return await _ask_next_hours(query, context)
 
 
 async def _ask_class(query_or_msg, context: ContextTypes.DEFAULT_TYPE):
     """After all days have hours, ask for class type."""
-    await query_or_msg.edit_message_text(
-        "Select your *class type* (applies to all your selected days):",
-        reply_markup=class_keyboard(),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    try:
+        await query_or_msg.edit_message_text(
+            "Select your *class type* (applies to all your selected days):",
+            reply_markup=class_keyboard(),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception:
+        context.user_data.clear()
+        try:
+            await query_or_msg.message.reply_text(
+                "Please send /start to continue signup.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+        return ConversationHandler.END
     return PICK_CLASS
 
 
 async def pick_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if not _signup_state_ok(context):
+        return await _end_signup_session(
+            query,
+            context,
+            "Session expired. Please send /start again.",
+        )
     class_type = query.data.split(":", 1)[1]
     context.user_data["class_type"] = class_type
 
     # Build confirmation summary
-    day_hours = context.user_data["day_hours"]
-    agent_name = context.user_data["agent_name"]
+    day_hours = context.user_data.get("day_hours") or {}
+    agent_name = context.user_data.get("agent_name")
+    if not agent_name:
+        return await _end_signup_session(
+            query,
+            context,
+            "Session data was lost. Please send /start again.",
+        )
     class_label = dict(CLASS_TYPES).get(class_type, class_type)
 
     summary_lines = ["*Signup Summary*\n", f"Agent: *{_esc(agent_name)}*", f"Class: *{_esc(class_label)}*\n"]
@@ -393,11 +551,18 @@ async def pick_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Are you sure you want to sign up?",
     ]
 
-    await query.edit_message_text(
-        "\n".join(summary_lines),
-        reply_markup=confirm_keyboard(),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    try:
+        await query.edit_message_text(
+            "\n".join(summary_lines),
+            reply_markup=confirm_keyboard(),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception:
+        return await _end_signup_session(
+            query,
+            context,
+            "Could not show confirmation. Please send /start again.",
+        )
     return CONFIRM
 
 
@@ -407,24 +572,64 @@ async def confirm_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     choice = query.data.split(":", 1)[1]
 
     if choice == "no":
-        await query.edit_message_text(
-            "Signup cancelled. You have *not* been signed up.\n"
-            "Use /start to begin again if you change your mind.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
         context.user_data.clear()
+        try:
+            await query.edit_message_text(
+                "Signup cancelled. You have *not* been signed up.\n"
+                "Use /start to begin again if you change your mind.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            try:
+                await query.message.reply_text(
+                    "Signup cancelled. Use /start to begin again.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
         return ConversationHandler.END
 
     event_id = context.user_data.get("event_id")
     event = await _get_event(event_id) if event_id else None
     if event is None:
-        await query.edit_message_text("The OT event has been closed. Signup could not be saved.")
+        context.user_data.clear()
+        try:
+            await query.edit_message_text(
+                "This OT signup has closed or is no longer available.\n\nSend /start when a new OT opens."
+            )
+        except Exception:
+            try:
+                await query.message.reply_text(
+                    "This OT signup has closed. Send /start when a new OT opens."
+                )
+            except Exception:
+                pass
         return ConversationHandler.END
 
-    from bot.models import Agent as AgentModel
-    agent = await sync_to_async(AgentModel.objects.get)(pk=context.user_data["agent_id"])
-    class_type = context.user_data["class_type"]
-    day_hours = context.user_data["day_hours"]
+    agent_id = context.user_data.get("agent_id")
+    if not agent_id:
+        return await _end_signup_session(
+            query,
+            context,
+            "Session expired. Please send /start again.",
+        )
+
+    agent = await _agent_by_pk(agent_id)
+    if agent is None:
+        return await _end_signup_session(
+            query,
+            context,
+            "Could not load your profile. Please send /start again.",
+        )
+
+    class_type = context.user_data.get("class_type")
+    day_hours = context.user_data.get("day_hours") or {}
+    if not class_type or not day_hours:
+        return await _end_signup_session(
+            query,
+            context,
+            "Signup data was incomplete. Please send /start again.",
+        )
     class_label = dict(CLASS_TYPES).get(class_type, "")
 
     saved = []
@@ -448,20 +653,57 @@ async def confirm_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif status == "full":
                 event_full = True
                 break
+            elif status == "gone":
+                context.user_data.clear()
+                try:
+                    await query.edit_message_text(
+                        "This OT event was removed. Your signup could not be completed.\n\nSend /start for a new OT."
+                    )
+                except Exception:
+                    try:
+                        await query.message.reply_text(
+                            "This OT event was removed. Send /start for a new OT."
+                        )
+                    except Exception:
+                        pass
+                return ConversationHandler.END
+            elif status == "closed":
+                context.user_data.clear()
+                try:
+                    await query.edit_message_text(
+                        "This OT signup has closed. Your remaining selections were not saved.\n\nSend /start when a new OT opens."
+                    )
+                except Exception:
+                    try:
+                        await query.message.reply_text(
+                            "This OT signup has closed. Send /start when a new OT opens."
+                        )
+                    except Exception:
+                        pass
+                return ConversationHandler.END
 
     if not saved:
-        if blocked_other_open:
-            await query.edit_message_text(
-                "You already have an active OT signup in another open event.\n"
-                "You cannot sign up for more than one OT at the same time."
-            )
-        elif event_full:
-            await query.edit_message_text(
-                f"The OT signup for *{_esc(event.title)}* is currently full.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        else:
-            await query.edit_message_text("You were already signed up for all selected days.")
+        context.user_data.clear()
+        try:
+            if blocked_other_open:
+                await query.edit_message_text(
+                    "You already have an active OT signup in another open event.\n"
+                    "You cannot sign up for more than one OT at the same time."
+                )
+            elif event_full:
+                await query.edit_message_text(
+                    f"The OT signup for *{_esc(event.title)}* is currently full.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            else:
+                await query.edit_message_text("You were already signed up for all selected days.")
+        except Exception:
+            try:
+                await query.message.reply_text(
+                    "Could not complete signup. Send /start to try again.",
+                )
+            except Exception:
+                pass
         return ConversationHandler.END
 
     lines = ["*Signed up!*\n", f"*{_esc(event.title)}*", f"Class: {_esc(class_label)}\n"]
@@ -469,11 +711,24 @@ async def confirm_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"  {day}: {_hours_label(day, hours)}")
     lines += ["", "Good luck with your OT!", "Your commitment is final and cannot be cancelled."]
 
-    await query.edit_message_text(
-        "\n".join(lines),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    try:
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception:
+        try:
+            await query.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
+
+    from bot.handlers.admin_handlers import begin_ot_closure_with_admin_approval
+
+    ev2 = await _get_event_row_by_pk(event.id)
     context.user_data.clear()
+    if ev2 and ev2.max_agents and ev2.is_full():
+        await begin_ot_closure_with_admin_approval(context.bot, ev2.id, "capacity")
+
     return ConversationHandler.END
 
 
@@ -547,7 +802,10 @@ def build_user_conversation() -> ConversationHandler:
             CONFIRM: [CallbackQueryHandler(confirm_signup, pattern=r"^uconfirm:")],
         },
         fallbacks=[CommandHandler("cancel", cancel_signup)],
+        allow_reentry=True,
         per_user=True,
         per_chat=True,
+        # per_message must stay False: with True, PTB ignores any update without callback_query,
+        # so /start and plain text entry never match this handler (see ConversationHandler.check_update).
         per_message=False,
     )
