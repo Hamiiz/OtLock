@@ -788,7 +788,6 @@ def build_user_conversation() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[
             CommandHandler("start", start, filters=filters.ChatType.PRIVATE),
-            MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, start),
         ],
         states={
             PICK_EVENT: [CallbackQueryHandler(select_event, pattern=r"^user_signup:")],
