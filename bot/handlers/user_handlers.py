@@ -741,6 +741,9 @@ async def cancel_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def my_ot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Standalone command for a user to see what they signed up for in the current event."""
     if update.effective_chat.type != "private":
+        await update.effective_message.reply_text(
+            "Please use /myot in a private chat with the bot."
+        )
         return
 
     user_id = update.effective_user.id
@@ -752,20 +755,24 @@ async def my_ot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from bot.models import OTSignup, OTEvent
     # Show signups for ALL active events
     signups = await sync_to_async(list)(
-        OTSignup.objects.filter(agent=agent, ot_event__is_open=True)
+        OTSignup.objects.filter(agent=agent, ot_event__is_open=True).select_related("ot_event")
     )
     if not signups:
         await update.message.reply_text("You have no active OT signups at the moment.")
         return
 
-    # Group by event
+    # Group by event ID (Django model instances are not safe dict keys here).
     from collections import defaultdict
     by_event = defaultdict(list)
+    event_by_id = {}
     for s in signups:
-        by_event[s.ot_event].append(s)
+        eid = s.ot_event_id
+        by_event[eid].append(s)
+        event_by_id[eid] = s.ot_event
 
     lines = ["*Your Active OT Signups*\n"]
-    for event, event_signups in by_event.items():
+    for event_id, event_signups in by_event.items():
+        event = event_by_id[event_id]
         lines.append(f"📦 *{_esc(event.title)}*")
         for s in event_signups:
             hrs = float(s.hours)

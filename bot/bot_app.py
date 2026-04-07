@@ -8,6 +8,7 @@ from bot.handlers.admin_handlers import (
     build_admin_conversation,
     close_signup,
     close_signup_selected,
+    close_signup_confirm_callback,
     approve_closure_callback,
     skip_closure_callback,
     scan_overdue_deadlines_on_startup,
@@ -109,6 +110,8 @@ def get_ptb_application():
         app.add_handler(CallbackQueryHandler(cancel_event_confirm, pattern=r"^cancelot_abort$"))
         app.add_handler(CallbackQueryHandler(remove_admin_callback, pattern=r"^rmadmin:"))
         app.add_handler(CallbackQueryHandler(close_signup_selected, pattern=r"^close_event:"))
+        app.add_handler(CallbackQueryHandler(close_signup_confirm_callback, pattern=r"^close_confirm:"))
+        app.add_handler(CallbackQueryHandler(close_signup_confirm_callback, pattern=r"^close_abort$"))
         app.add_handler(CallbackQueryHandler(approve_closure_callback, pattern=r"^approve_closure:"))
         app.add_handler(CallbackQueryHandler(skip_closure_callback, pattern=r"^skip_closure:"))
 

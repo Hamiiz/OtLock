@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 from asgiref.sync import sync_to_async
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ContextTypes,
     ConversationHandler,
@@ -870,11 +870,7 @@ async def close_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if len(events) == 1:
         event = events[0]
-        await _close_signup_for_event(event, context)
-        await update.message.reply_text(
-            f"✅ *{_esc(event.title)}* has been closed. Results posted to group and CSV sent to admins.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await _send_close_confirmation_prompt(update.message, event)
         return
 
     keyboard = select_event_keyboard(events, "close_event")
@@ -897,6 +893,62 @@ async def close_signup_selected(update: Update, context: ContextTypes.DEFAULT_TY
         event = await _get_event(event_id)
     except Exception:
         await query.edit_message_text("Invalid event selection.")
+        return
+
+    if not event or not event.is_open:
+        await query.edit_message_text("This OT event is already closed.")
+        return
+
+    await _send_close_confirmation_prompt(query, event, use_edit=True)
+
+
+async def _send_close_confirmation_prompt(target, event, use_edit: bool = False):
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Yes, close now",
+                    callback_data=f"close_confirm:{event.id}",
+                ),
+                InlineKeyboardButton("Cancel", callback_data="close_abort"),
+            ]
+        ]
+    )
+    text = (
+        f"Are you sure you want to close *{_esc(event.title)}* now?\n\n"
+        "This will post the closed list to group and send CSV to admins."
+    )
+    if use_edit:
+        await target.edit_message_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard,
+        )
+    else:
+        await target.reply_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard,
+        )
+
+
+async def close_signup_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Final confirmation for closing an OT event."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.answer("Not authorised.", show_alert=True)
+        return
+
+    if query.data == "close_abort":
+        await query.edit_message_text("Close cancelled. OT remains open.")
+        return
+
+    try:
+        event_id = int(query.data.split(":", 1)[1])
+        event = await _get_event(event_id)
+    except Exception:
+        await query.edit_message_text("Invalid close request.")
         return
 
     if not event or not event.is_open:
