@@ -31,6 +31,7 @@ from bot.utils import (
     confirm_keyboard,
     select_event_keyboard,
     CLASS_TYPES,
+    ALL_DAYS,
     _hours_label,
     _esc,
 )
@@ -41,6 +42,8 @@ PICK_DAYS = 0
 PICK_HOURS = 1
 PICK_CLASS = 2
 CONFIRM = 3
+
+_DAY_INDEX = {d: i for i, d in enumerate(ALL_DAYS)}
 
 
 # ── DB helpers ───────────────────────────────────────────────────────────────
@@ -171,6 +174,14 @@ async def _end_signup_session(
 
 def _signup_state_ok(context: ContextTypes.DEFAULT_TYPE) -> bool:
     return bool(context.user_data.get("event_id"))
+
+
+def _sorted_days(days):
+    return sorted(days, key=lambda d: _DAY_INDEX.get(d, 99))
+
+
+def _sorted_day_hours(day_hours):
+    return sorted(day_hours.items(), key=lambda kv: _DAY_INDEX.get(kv[0], 99))
 
 
 # ── Handlers ─────────────────────────────────────────────────────────────────
@@ -408,7 +419,7 @@ async def days_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
     # Queue every selected day for hours selection
-    context.user_data["pending_days"] = list(selected)
+    context.user_data["pending_days"] = _sorted_days(list(selected))
     return await _ask_next_hours(query, context)
 
 
@@ -542,7 +553,7 @@ async def pick_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
     class_label = dict(CLASS_TYPES).get(class_type, class_type)
 
     summary_lines = ["*Signup Summary*\n", f"Agent: *{_esc(agent_name)}*", f"Class: *{_esc(class_label)}*\n"]
-    for day, hours in day_hours.items():
+    for day, hours in _sorted_day_hours(day_hours):
         summary_lines.append(f"  {day}: *{_hours_label(day, hours)}*")
 
     summary_lines += [
@@ -635,7 +646,7 @@ async def confirm_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     saved = []
     blocked_other_open = False
     event_full = False
-    for day, hours in day_hours.items():
+    for day, hours in _sorted_day_hours(day_hours):
         already = await _already_signed_up_day(agent, event, day)
         if not already:
             _, status = await _create_signup(
@@ -707,7 +718,7 @@ async def confirm_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     lines = ["*Signed up!*\n", f"*{_esc(event.title)}*", f"Class: {_esc(class_label)}\n"]
-    for day, hours in saved:
+    for day, hours in _sorted_day_hours(dict(saved)):
         lines.append(f"  {day}: {_hours_label(day, hours)}")
     lines += ["", "Good luck with your OT!", "Your commitment is final and cannot be cancelled."]
 
@@ -741,6 +752,9 @@ async def cancel_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def my_ot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Standalone command for a user to see what they signed up for in the current event."""
     if update.effective_chat.type != "private":
+        await update.effective_message.reply_text(
+            "Please use /myot in a private chat with the bot."
+        )
         return
 
     user_id = update.effective_user.id
@@ -752,21 +766,29 @@ async def my_ot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from bot.models import OTSignup, OTEvent
     # Show signups for ALL active events
     signups = await sync_to_async(list)(
-        OTSignup.objects.filter(agent=agent, ot_event__is_open=True)
+        OTSignup.objects.filter(agent=agent, ot_event__is_open=True).select_related("ot_event")
     )
     if not signups:
         await update.message.reply_text("You have no active OT signups at the moment.")
         return
 
-    # Group by event
+    # Group by event ID (Django model instances are not safe dict keys here).
     from collections import defaultdict
     by_event = defaultdict(list)
+    event_by_id = {}
     for s in signups:
-        by_event[s.ot_event].append(s)
+        eid = s.ot_event_id
+        by_event[eid].append(s)
+        event_by_id[eid] = s.ot_event
 
     lines = ["*Your Active OT Signups*\n"]
-    for event, event_signups in by_event.items():
+    for event_id, event_signups in by_event.items():
+        event = event_by_id[event_id]
         lines.append(f"📦 *{_esc(event.title)}*")
+        event_signups = sorted(
+            event_signups,
+            key=lambda s: (_DAY_INDEX.get(s.day, 99), s.confirmed_at),
+        )
         for s in event_signups:
             hrs = float(s.hours)
             class_label = dict(CLASS_TYPES).get(s.class_type, s.class_type)
