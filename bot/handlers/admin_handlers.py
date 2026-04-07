@@ -41,6 +41,7 @@ from django.core.cache import cache
 from django.utils import timezone
 from bot.models import OTEvent, OTSignup
 from bot.utils import (
+    ALL_DAYS,
     days_keyboard,
     slot_keyboard_weekday,
     slot_keyboard_weekend,
@@ -61,6 +62,12 @@ ASK_SLOTS = 2
 ASK_SLOT_CUSTOM = 3
 ASK_MAX = 4
 ASK_DEADLINE = 5
+
+_DAY_INDEX = {d: i for i, d in enumerate(ALL_DAYS)}
+
+
+def _sorted_days(days):
+    return sorted(days, key=lambda d: _DAY_INDEX.get(d, 99))
 
 
 async def _tg_call(coro_factory, retries: int = 3, delay_seconds: float = 0.8):
@@ -474,7 +481,7 @@ async def _init_edit_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, ev
     context.user_data.clear()
     context.user_data["edit_event_id"] = event.id
     context.user_data["title"] = event.title
-    context.user_data["selected_days"] = list(event.days)
+    context.user_data["selected_days"] = _sorted_days(list(event.days))
     context.user_data["time_slots"] = event.time_slots.copy()
     context.user_data["max_agents"] = event.max_agents
     context.user_data["is_editing"] = True
@@ -554,6 +561,9 @@ async def days_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Please select at least one day!", show_alert=True)
         return ASK_DAYS
 
+    # Normalize to calendar order regardless of click order.
+    selected = _sorted_days(list(selected))
+    context.user_data["selected_days"] = selected
     # Store which days still need slot configuration
     context.user_data["pending_days"] = list(selected)
     return await _ask_next_slot(query, context)
@@ -695,7 +705,7 @@ async def receive_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ASK_DEADLINE
 
     title = context.user_data["title"]
-    days = context.user_data["selected_days"]
+    days = _sorted_days(list(context.user_data["selected_days"]))
     time_slots = context.user_data["time_slots"]
     max_agents = context.user_data["max_agents"]
     uid = update.effective_user.id
@@ -705,9 +715,12 @@ async def receive_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if day not in time_slots:
             time_slots[day] = [8.0] if day in WEEKEND_DAYS else [2.0, 4.0]
 
+    # Keep slot mapping ordered by weekday for stable announcement rendering.
+    ordered_time_slots = {day: time_slots[day] for day in days if day in time_slots}
+
     edit_event_id = context.user_data.get("edit_event_id")
     if edit_event_id:
-        event = await _update_event(edit_event_id, title, days, time_slots, max_agents, deadline)
+        event = await _update_event(edit_event_id, title, days, ordered_time_slots, max_agents, deadline)
         announcement = format_announcement(event)
         keyboard = announcement_keyboard(settings.BOT_USERNAME, event.id)
         if getattr(event, 'announcement_message_id', None):
@@ -731,7 +744,7 @@ async def receive_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN,
         )
     else:
-        event = await _create_event(title, uid, days, time_slots, max_agents, deadline)
+        event = await _create_event(title, uid, days, ordered_time_slots, max_agents, deadline)
         announcement = format_announcement(event)
         keyboard = announcement_keyboard(settings.BOT_USERNAME, event.id)
 
