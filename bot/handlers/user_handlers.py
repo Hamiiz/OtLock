@@ -10,6 +10,8 @@ Flow:
 """
 from __future__ import annotations
 
+import secrets
+
 from asgiref.sync import sync_to_async
 
 from telegram import Update
@@ -176,6 +178,26 @@ def _signup_state_ok(context: ContextTypes.DEFAULT_TYPE) -> bool:
     return bool(context.user_data.get("event_id"))
 
 
+def _new_wizard_session_id() -> str:
+    # 8 hex chars, fits well into callback_data (and regex checks in handlers).
+    return secrets.token_hex(4)
+
+
+async def _require_wizard_session(query, context: ContextTypes.DEFAULT_TYPE, callback_session_id: str):
+    expected = context.user_data.get("wizard_session_id")
+    if not expected or callback_session_id != expected:
+        try:
+            await query.answer("This selection is outdated.", show_alert=True)
+        except Exception:
+            pass
+        return await _end_signup_session(
+            query,
+            context,
+            "This signup session is no longer valid. Please send /start again.",
+        )
+    return True
+
+
 def _sorted_days(days):
     return sorted(days, key=lambda d: _DAY_INDEX.get(d, 99))
 
@@ -189,6 +211,7 @@ def _sorted_day_hours(day_hours):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Entry point – /start or first message in private chat."""
     context.user_data.clear()
+    context.user_data["wizard_session_id"] = _new_wizard_session_id()
 
     # 1. Check for deep-link argument
     event = None
@@ -229,7 +252,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             event = events[0]
         else:
             # Multi-OT: show picker
-            keyboard = select_event_keyboard(events, "user_signup")
+            keyboard = select_event_keyboard(
+                events,
+                "user_signup",
+                session_id=context.user_data["wizard_session_id"],
+            )
             await update.message.reply_text(
                 "Multiple OT shifts are active.\n"
                 "Pick the exact OT for your shift from the list below:",
@@ -254,9 +281,18 @@ async def select_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    data = query.data  # "user_signup:123"
+    data = query.data  # "user_signup:<session>:<event_id>"
     try:
-        event_id = int(data.split(":")[1])
+        _prefix, callback_session_id, event_id_str = data.split(":", 2)
+        event_id = int(event_id_str)
+        session_ok = await _require_wizard_session(
+            query,
+            context,
+            callback_session_id,
+        )
+        if session_ok is not True:
+            return session_ok
+
         event = await _get_event(event_id)
         if not event:
             context.user_data.clear()
@@ -280,7 +316,7 @@ async def select_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["event_id"] = event.id
         # We need to manually call the next step because start() logic didn't finish
         return await _start_signup_flow(update, context, event)
-    except (IndexError, ValueError):
+    except ValueError:
         context.user_data.clear()
         try:
             await query.edit_message_text("Invalid selection.")
@@ -291,6 +327,8 @@ async def select_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _start_signup_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, event):
     """Internal helper to shared logic for starting the actual signup steps."""
+    context.user_data.setdefault("wizard_session_id", _new_wizard_session_id())
+
     # Check for existing agent
     existing_agent = await _get_agent(update.effective_user.id)
     if existing_agent:
@@ -312,6 +350,9 @@ async def _start_signup_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     context.user_data["selected_days"] = []
     context.user_data["day_hours"] = {}   # {day: hours}
+    # Cache for hour-picker steps — avoids a DB round-trip on every day transition.
+    context.user_data["event_days"] = event.days
+    context.user_data["signup_time_slots"] = dict(event.time_slots or {})
 
     async def _send_text(text, **kwargs):
         if update.callback_query:
@@ -325,8 +366,6 @@ async def _start_signup_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
             "Please enter your *agent name* exactly as it appears in your roster:",
             parse_mode=ParseMode.MARKDOWN,
         )
-        # Temporarily store event days for after name entry
-        context.user_data["event_days"] = event.days
         return _ASK_NAME
 
     await _send_text(
@@ -334,10 +373,13 @@ async def _start_signup_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
         f"Signing up for: *{_esc(event.title)}*\n\n"
         "Select the days you want to work OT.\n"
         "Tap a day to toggle it, then press Done.",
-        reply_markup=user_day_multi_keyboard(event.days, []),
+        reply_markup=user_day_multi_keyboard(
+            event.days,
+            [],
+            session_id=context.user_data["wizard_session_id"],
+        ),
         parse_mode=ParseMode.MARKDOWN,
     )
-    context.user_data["event_days"] = event.days
     return PICK_DAYS
 
 
@@ -367,7 +409,11 @@ async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Name saved: *{_esc(agent_name)}*\n\n"
         "Select the days you want to work OT.\n"
         "Tap a day to toggle it, then press Done.",
-        reply_markup=user_day_multi_keyboard(event_days, []),
+        reply_markup=user_day_multi_keyboard(
+            event_days,
+            [],
+            session_id=context.user_data["wizard_session_id"],
+        ),
         parse_mode=ParseMode.MARKDOWN,
     )
     return PICK_DAYS
@@ -382,7 +428,20 @@ async def toggle_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context,
             "This signup session is no longer valid (it may have expired). Please send /start again.",
         )
-    day = query.data.split(":", 1)[1]
+    try:
+        _prefix, callback_session_id, day = query.data.split(":", 2)
+    except ValueError:
+        context.user_data.clear()
+        try:
+            await query.edit_message_text("Invalid selection.")
+        except Exception:
+            pass
+        return ConversationHandler.END
+
+    session_ok = await _require_wizard_session(query, context, callback_session_id)
+    if session_ok is not True:
+        return session_ok
+
     selected = context.user_data.setdefault("selected_days", [])
     event_days = context.user_data.get("event_days") or []
     if day in selected:
@@ -391,7 +450,11 @@ async def toggle_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
         selected.append(day)
     try:
         await query.edit_message_reply_markup(
-            reply_markup=user_day_multi_keyboard(event_days, selected)
+            reply_markup=user_day_multi_keyboard(
+                event_days,
+                selected,
+                session_id=context.user_data["wizard_session_id"],
+            )
         )
     except Exception:
         await query.message.reply_text(
@@ -405,6 +468,17 @@ async def toggle_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def days_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    try:
+        _prefix, callback_session_id = query.data.split(":", 1)
+    except ValueError:
+        context.user_data.clear()
+        await query.answer()
+        return ConversationHandler.END
+
+    session_ok = await _require_wizard_session(query, context, callback_session_id)
+    if session_ok is not True:
+        return session_ok
+
     if not _signup_state_ok(context) or "event_days" not in context.user_data:
         await query.answer()
         return await _end_signup_session(
@@ -418,6 +492,22 @@ async def days_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return PICK_DAYS
 
     await query.answer()
+    # One DB check when leaving day selection; refresh slot cache for the hours wizard.
+    eid = context.user_data.get("event_id")
+    event_row = await _get_event_row_by_pk(eid)
+    if event_row is None:
+        return await _end_signup_session(
+            query,
+            context,
+            "This OT event is no longer available. Please send /start when a new signup opens.",
+        )
+    if not event_row.is_open:
+        return await _end_signup_session(
+            query,
+            context,
+            "This OT signup has *closed* while you were selecting options.\n\nSend /start when a new OT is announced.",
+        )
+    context.user_data["signup_time_slots"] = dict(event_row.time_slots or {})
     # Queue every selected day for hours selection
     context.user_data["pending_days"] = _sorted_days(list(selected))
     return await _ask_next_hours(query, context)
@@ -433,22 +523,20 @@ async def _ask_next_hours(query_or_msg, context: ContextTypes.DEFAULT_TYPE):
     day = pending[0]
     context.user_data["current_hours_day"] = day
 
-    eid = context.user_data.get("event_id")
-    event = await _get_event_row_by_pk(eid)
-    if event is None:
-        return await _end_signup_session(
-            query_or_msg if hasattr(query_or_msg, "answer") else None,
-            context,
-            "This OT event is no longer available. Please send /start when a new signup opens.",
-        )
-    if not event.is_open:
-        return await _end_signup_session(
-            query_or_msg if hasattr(query_or_msg, "answer") else None,
-            context,
-            "This OT signup has *closed* while you were selecting options.\n\nSend /start when a new OT is announced.",
-        )
+    ts = context.user_data.get("signup_time_slots")
+    if ts is None:
+        eid = context.user_data.get("event_id")
+        event = await _get_event_row_by_pk(eid)
+        if event is None or not event.is_open:
+            return await _end_signup_session(
+                query_or_msg if hasattr(query_or_msg, "answer") else None,
+                context,
+                "This OT signup is no longer available. Please send /start again.",
+            )
+        ts = dict(event.time_slots or {})
+        context.user_data["signup_time_slots"] = ts
 
-    slots = [float(s) for s in (event.time_slots or {}).get(day, [])]
+    slots = [float(s) for s in ts.get(day, [])]
 
     if not slots:
         try:
@@ -466,7 +554,11 @@ async def _ask_next_hours(query_or_msg, context: ContextTypes.DEFAULT_TYPE):
     try:
         await query_or_msg.edit_message_text(
             f"*{day}* — how many hours will you work?",
-            reply_markup=user_hour_keyboard(day, slots),
+            reply_markup=user_hour_keyboard(
+                day,
+                slots,
+                session_id=context.user_data["wizard_session_id"],
+            ),
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception:
@@ -500,7 +592,18 @@ async def pick_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "This step is out of date. Please send /start again.",
         )
     try:
-        hours = float(query.data.split(":", 1)[1])
+        _prefix, callback_session_id, slot_str = query.data.split(":", 2)
+        session_ok = await _require_wizard_session(query, context, callback_session_id)
+        if session_ok is not True:
+            return session_ok
+        # Only accept the next expected day to prevent stale double-taps / out-of-order taps.
+        if not pending or pending[0] != day:
+            return await _end_signup_session(
+                query,
+                context,
+                "This hour selection is no longer valid. Please send /start again.",
+            )
+        hours = float(slot_str)
     except (IndexError, ValueError):
         return await _end_signup_session(query, context, "Invalid selection. Please send /start again.")
     context.user_data.setdefault("day_hours", {})[day] = hours
@@ -513,7 +616,7 @@ async def _ask_class(query_or_msg, context: ContextTypes.DEFAULT_TYPE):
     try:
         await query_or_msg.edit_message_text(
             "Select your *class type* (applies to all your selected days):",
-            reply_markup=class_keyboard(),
+            reply_markup=class_keyboard(context.user_data["wizard_session_id"]),
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception:
@@ -538,7 +641,13 @@ async def pick_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context,
             "Session expired. Please send /start again.",
         )
-    class_type = query.data.split(":", 1)[1]
+    try:
+        _prefix, callback_session_id, class_type = query.data.split(":", 2)
+    except ValueError:
+        return await _end_signup_session(query, context, "Invalid selection. Please send /start again.")
+    session_ok = await _require_wizard_session(query, context, callback_session_id)
+    if session_ok is not True:
+        return session_ok
     context.user_data["class_type"] = class_type
 
     # Build confirmation summary
@@ -565,7 +674,7 @@ async def pick_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await query.edit_message_text(
             "\n".join(summary_lines),
-            reply_markup=confirm_keyboard(),
+            reply_markup=confirm_keyboard(context.user_data["wizard_session_id"]),
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception:
@@ -580,7 +689,18 @@ async def pick_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def confirm_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    choice = query.data.split(":", 1)[1]
+    try:
+        _prefix, callback_session_id, choice = query.data.split(":", 2)
+    except ValueError:
+        return await _end_signup_session(
+            query,
+            context,
+            "Invalid selection. Please send /start again.",
+        )
+
+    session_ok = await _require_wizard_session(query, context, callback_session_id)
+    if session_ok is not True:
+        return session_ok
 
     if choice == "no":
         context.user_data.clear()
@@ -749,6 +869,19 @@ async def cancel_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def _outdated_signup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles legacy inline callbacks without session_id to avoid callback-query spinners."""
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    await query.answer("This button is outdated. Send /start to begin again.", show_alert=False)
+    return await _end_signup_session(
+        query,
+        context,
+        "This signup session is no longer valid. Please send /start again.",
+    )
+
+
 async def my_ot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Standalone command for a user to see what they signed up for in the current event."""
     if update.effective_chat.type != "private":
@@ -812,17 +945,48 @@ def build_user_conversation() -> ConversationHandler:
             CommandHandler("start", start, filters=filters.ChatType.PRIVATE),
         ],
         states={
-            PICK_EVENT: [CallbackQueryHandler(select_event, pattern=r"^user_signup:")],
+            PICK_EVENT: [
+                CallbackQueryHandler(
+                    select_event,
+                    pattern=r"^user_signup:[0-9a-fA-F]{8}:\d+$",
+                )
+            ],
             _ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name)],
             PICK_DAYS: [
-                CallbackQueryHandler(toggle_day, pattern=r"^uday_toggle:"),
-                CallbackQueryHandler(days_done, pattern=r"^udays_done$"),
+                CallbackQueryHandler(
+                    toggle_day, pattern=r"^uday_toggle:[0-9a-fA-F]{8}:[A-Za-z]+$"
+                ),
+                CallbackQueryHandler(
+                    days_done, pattern=r"^udays_done:[0-9a-fA-F]{8}$"
+                ),
             ],
-            PICK_HOURS: [CallbackQueryHandler(pick_hours, pattern=r"^uhour:")],
-            PICK_CLASS: [CallbackQueryHandler(pick_class, pattern=r"^uclass:")],
-            CONFIRM: [CallbackQueryHandler(confirm_signup, pattern=r"^uconfirm:")],
+            PICK_HOURS: [
+                CallbackQueryHandler(
+                    pick_hours, pattern=r"^uhour:[0-9a-fA-F]{8}:[0-9.]+$"
+                )
+            ],
+            PICK_CLASS: [
+                CallbackQueryHandler(
+                    pick_class, pattern=r"^uclass:[0-9a-fA-F]{8}:[A-Za-z_]+$"
+                )
+            ],
+            CONFIRM: [
+                CallbackQueryHandler(
+                    confirm_signup,
+                    pattern=r"^uconfirm:[0-9a-fA-F]{8}:(yes|no)$",
+                )
+            ],
         },
-        fallbacks=[CommandHandler("cancel", cancel_signup)],
+        fallbacks=[
+            CommandHandler("cancel", cancel_signup),
+            CallbackQueryHandler(
+                _outdated_signup_callback,
+                pattern=(
+                    r"^(user_signup:\d+|uday_toggle:[A-Za-z]+|udays_done$|uhour:[0-9.]+|"
+                    r"uclass:[A-Za-z_]+|uconfirm:(yes|no))$"
+                ),
+            ),
+        ],
         allow_reentry=True,
         per_user=True,
         per_chat=True,

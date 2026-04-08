@@ -3,7 +3,16 @@ from django.test import TestCase
 
 from bot.handlers.user_handlers import _create_signup
 from bot.models import Agent, OTEvent, OTSignup
-from bot.utils import announcement_keyboard, generate_csv
+from bot.utils import (
+    announcement_keyboard,
+    generate_csv,
+    split_text_for_telegram_messages,
+    user_day_multi_keyboard,
+    user_hour_keyboard,
+    class_keyboard,
+    confirm_keyboard,
+    select_event_keyboard,
+)
 
 
 class OTRegressionTests(TestCase):
@@ -74,3 +83,36 @@ class OTRegressionTests(TestCase):
         self.assertIn("Agent One,2.0,", lines)
         self.assertIn("Agent Two,,4.0", lines)
         self.assertIn("Agent Three,2.0,", lines)
+
+    def test_split_text_for_telegram_messages_respects_limit(self):
+        parts = split_text_for_telegram_messages("a\n" * 3000, max_len=100)
+        self.assertGreater(len(parts), 1)
+        self.assertTrue(all(len(p) <= 100 for p in parts))
+
+    def test_user_day_keyboard_callback_includes_session(self):
+        kb = user_day_multi_keyboard(["Monday"], [], session_id="deadbeef")
+        # Day button
+        day_cb = kb.inline_keyboard[0][0].callback_data
+        self.assertEqual(day_cb, "uday_toggle:deadbeef:Monday")
+        # Done button
+        done_cb = kb.inline_keyboard[-1][0].callback_data
+        self.assertEqual(done_cb, "udays_done:deadbeef")
+
+    def test_user_hour_keyboard_callback_includes_session(self):
+        kb = user_hour_keyboard("Monday", [2.0, 4.0], session_id="deadbeef")
+        cbs = [btn.callback_data for row in kb.inline_keyboard for btn in row]
+        self.assertIn("uhour:deadbeef:2.0", cbs)
+        self.assertIn("uhour:deadbeef:4.0", cbs)
+
+    def test_confirm_keyboard_callback_includes_session(self):
+        kb = confirm_keyboard("deadbeef")
+        yes_cb = kb.inline_keyboard[0][0].callback_data
+        no_cb = kb.inline_keyboard[0][1].callback_data
+        self.assertEqual(yes_cb, "uconfirm:deadbeef:yes")
+        self.assertEqual(no_cb, "uconfirm:deadbeef:no")
+
+    def test_select_event_keyboard_callback_includes_session(self):
+        event = self._make_event("OT Session Test")
+        kb = select_event_keyboard([event], "user_signup", session_id="deadbeef")
+        cb = kb.inline_keyboard[0][0].callback_data
+        self.assertEqual(cb, f"user_signup:deadbeef:{event.id}")
