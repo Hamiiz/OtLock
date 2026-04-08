@@ -1,0 +1,38 @@
+Usage:
+  flyctl.exe machine [command]
+
+Aliases:
+  machine, machines, m
+
+Available Commands:
+  api-proxy   Establish a proxy to the Machine API through a Wireguard tunnel for local connections
+  clone       Clone a Fly Machine
+  cordon      Deactivate all services on a machine
+  create      Create, but don't start, a machine
+  destroy     Destroy Fly machines
+  egress-ip   Manage static egress IPs
+  exec        Execute a command on a machine
+  kill        Kill (SIGKILL) a Fly machine
+  leases      Manage machine leases
+  list        List Fly machines
+  place       Simulate Machine placements
+  restart     Restart one or more Fly machines
+  run         Run a machine
+  start       Start one or more Fly machines
+  status      Show current status of a running machine
+  stop        Stop one or more Fly machines
+  suspend     Suspend one or more Fly machines
+  uncordon    Reactivate all services on a machine
+  update      Update a machine
+  wait        Wait for a machine to reach a state
+
+Flags:
+  -h, --help   help for machine
+
+Global Flags:
+  -t, --access-token string   Fly API Access Token
+      --debug                 Print additional logs and traces
+      --verbose               Verbose output
+
+Use "flyctl.exe machine [command] --help" for more information about a command.
+

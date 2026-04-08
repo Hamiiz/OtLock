@@ -14,7 +14,7 @@ import secrets
 
 from asgiref.sync import sync_to_async
 
-from telegram import Update
+from telegram import Update, ReplyKeyboardRemove
 from telegram.ext import (
     ContextTypes,
     ConversationHandler,
@@ -27,11 +27,11 @@ from telegram.constants import ParseMode
 
 from bot.models import Agent, OTEvent, OTSignup
 from bot.utils import (
-    user_day_multi_keyboard,
-    user_hour_keyboard,
-    class_keyboard,
-    confirm_keyboard,
-    select_event_keyboard,
+    user_event_reply_keyboard,
+    user_days_reply_keyboard,
+    user_hours_reply_keyboard,
+    user_class_reply_keyboard,
+    user_confirm_reply_keyboard,
     CLASS_TYPES,
     ALL_DAYS,
     _hours_label,
@@ -252,11 +252,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             event = events[0]
         else:
             # Multi-OT: show picker
-            keyboard = select_event_keyboard(
-                events,
-                "user_signup",
-                session_id=context.user_data["wizard_session_id"],
-            )
+            context.user_data["open_events"] = events
+            keyboard = user_event_reply_keyboard(events)
             await update.message.reply_text(
                 "Multiple OT shifts are active.\n"
                 "Pick the exact OT for your shift from the list below:",
@@ -373,11 +370,7 @@ async def _start_signup_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
         f"Signing up for: *{_esc(event.title)}*\n\n"
         "Select the days you want to work OT.\n"
         "Tap a day to toggle it, then press Done.",
-        reply_markup=user_day_multi_keyboard(
-            event.days,
-            [],
-            session_id=context.user_data["wizard_session_id"],
-        ),
+        reply_markup=user_days_reply_keyboard(event.days),
         parse_mode=ParseMode.MARKDOWN,
     )
     return PICK_DAYS
@@ -409,14 +402,352 @@ async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Name saved: *{_esc(agent_name)}*\n\n"
         "Select the days you want to work OT.\n"
         "Tap a day to toggle it, then press Done.",
-        reply_markup=user_day_multi_keyboard(
-            event_days,
-            [],
-            session_id=context.user_data["wizard_session_id"],
-        ),
+        reply_markup=user_days_reply_keyboard(event_days),
         parse_mode=ParseMode.MARKDOWN,
     )
     return PICK_DAYS
+
+
+def _parse_day_from_text(text: str, allowed_days: list[str]) -> str | None:
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+    # Normalize by exact match (case-insensitive) against allowed day names.
+    for d in allowed_days:
+        if d.lower() == t:
+            return d
+    return None
+
+
+def _parse_hours_from_text(text: str) -> float | None:
+    if not text:
+        return None
+    t = text.strip().lower()
+    # Expected formats: "2", "2.0", "2 hrs", "2.0hrs"
+    t = t.replace("hrs", "").replace("hr", "").strip()
+    # Keep only digits and dot.
+    cleaned = "".join(ch for ch in t if ch.isdigit() or ch == ".")
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _parse_class_from_text(text: str) -> str | None:
+    if not text:
+        return None
+    label_to_code = {label.lower(): code for code, label in CLASS_TYPES}
+    t = text.strip().lower()
+    return label_to_code.get(t)
+
+
+async def pick_event_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Message-based OT selection (no inline callbacks)."""
+    text = update.message.text or ""
+    # Expected: "OT <id>"
+    parts = text.strip().split()
+    if len(parts) < 2:
+        await update.message.reply_text("Select an OT using the buttons above.")
+        return PICK_EVENT
+    try:
+        eid = int(parts[-1])
+    except ValueError:
+        await update.message.reply_text("Invalid OT selection. Try again.")
+        return PICK_EVENT
+
+    event = await _get_event(eid)
+    if not event:
+        context.user_data.clear()
+        await update.message.reply_text(
+            "This OT event is no longer active. Send /start to see current OTs."
+        )
+        return ConversationHandler.END
+
+    context.user_data["event_id"] = event.id
+    # Proceed with signup wizard.
+    return await _start_signup_flow(update, context, event)
+
+
+async def pick_days_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Day toggle + completion ('Done') in message-based flow."""
+    if not _signup_state_ok(context) or "event_days" not in context.user_data:
+        await update.message.reply_text(
+            "This signup session expired. Send /start again."
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    allowed_days: list[str] = context.user_data.get("event_days") or []
+    selected = context.user_data.setdefault("selected_days", [])
+    text = update.message.text.strip()
+
+    if text.lower() == "done":
+        if not selected:
+            await update.message.reply_text("Select at least one day before pressing Done.")
+            return PICK_DAYS
+        context.user_data["pending_days"] = _sorted_days(list(selected))
+        # Ask for hours for the first pending day.
+        return await _ask_next_hours_message(update, context)
+
+    day = _parse_day_from_text(text, allowed_days)
+    if not day:
+        await update.message.reply_text(
+            "Invalid day. Tap one of the day buttons, or press Done when finished."
+        )
+        return PICK_DAYS
+
+    if day in selected:
+        selected.remove(day)
+    else:
+        selected.append(day)
+
+    ordered = _sorted_days(list(selected))
+    pretty = ", ".join(ordered) if ordered else "(none yet)"
+    await update.message.reply_text(
+        f"Selected days: {pretty}\n\nTap more days or press Done.",
+        reply_markup=user_days_reply_keyboard(allowed_days),
+    )
+    return PICK_DAYS
+
+
+async def _ask_next_hours_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending = context.user_data.get("pending_days") or []
+    if not pending:
+        return await _ask_class_message(update, context)
+
+    day = pending[0]
+    context.user_data["current_hours_day"] = day
+
+    ts = context.user_data.get("signup_time_slots") or {}
+    slots = ts.get(day, []) or []
+    # If admin left day with no slots, skip it.
+    if not slots:
+        pending.pop(0)
+        context.user_data["pending_days"] = pending
+        return await _ask_next_hours_message(update, context)
+
+    await update.message.reply_text(
+        f"For *{day}*, select the hours you can work:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=user_hours_reply_keyboard(slots),
+    )
+    return PICK_HOURS
+
+
+async def pick_hours_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Hour selection in message-based flow."""
+    if not _signup_state_ok(context):
+        await update.message.reply_text("Session expired. Send /start again.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    pending = context.user_data.get("pending_days") or []
+    day = context.user_data.get("current_hours_day")
+    if not pending or not day:
+        await update.message.reply_text("This step is out of date. Send /start again.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    text = update.message.text.strip()
+    hours = _parse_hours_from_text(text)
+    if hours is None:
+        await update.message.reply_text("Please choose one of the hour buttons.")
+        return PICK_HOURS
+
+    ts = context.user_data.get("signup_time_slots") or {}
+    allowed = ts.get(day, []) or []
+    if hours not in allowed:
+        await update.message.reply_text("That hour isn't available for this day. Try again.")
+        return PICK_HOURS
+
+    context.user_data.setdefault("day_hours", {})[day] = hours
+    pending.pop(0)
+    context.user_data["pending_days"] = pending
+    return await _ask_next_hours_message(update, context)
+
+
+async def _ask_class_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Select your class type (applies to all your selected days):",
+        reply_markup=user_class_reply_keyboard(),
+    )
+    return PICK_CLASS
+
+
+async def pick_class_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _signup_state_ok(context):
+        await update.message.reply_text("Session expired. Send /start again.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    class_type = _parse_class_from_text(update.message.text or "")
+    if not class_type:
+        await update.message.reply_text(
+            "Invalid class type. Tap one of the buttons.",
+            reply_markup=user_class_reply_keyboard(),
+        )
+        return PICK_CLASS
+
+    context.user_data["class_type"] = class_type
+    class_label = dict(CLASS_TYPES).get(class_type, class_type)
+
+    day_hours = context.user_data.get("day_hours") or {}
+    if not day_hours:
+        await update.message.reply_text("No day/hour selections found. Send /start again.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    agent_name = context.user_data.get("agent_name") or ""
+    if not agent_name:
+        await update.message.reply_text("Session data missing. Send /start again.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    summary_lines = [
+        "*Signup Summary*",
+        f"Agent: *{_esc(agent_name)}*",
+        f"Class: *{_esc(class_label)}*",
+        "",
+    ]
+    for day, hours in _sorted_day_hours(day_hours):
+        summary_lines.append(f"  {day}: {_hours_label(day, hours)}")
+    summary_lines += [
+        "",
+        "*Important:* Once you confirm, you cannot cancel your OT commitment.",
+        "Are you sure you want to sign up?",
+    ]
+
+    await update.message.reply_text(
+        "\n".join(summary_lines),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=user_confirm_reply_keyboard(),
+    )
+    return CONFIRM
+
+
+async def confirm_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _signup_state_ok(context):
+        await update.message.reply_text("Session expired. Send /start again.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    text = (update.message.text or "").strip().lower()
+    if text == "cancel":
+        context.user_data.clear()
+        await update.message.reply_text(
+            "Signup cancelled. Use /start to begin again.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+
+    if text != "confirm":
+        await update.message.reply_text(
+            "Please choose Confirm or Cancel.",
+            reply_markup=user_confirm_reply_keyboard(),
+        )
+        return CONFIRM
+
+    # Save the signup(s).
+    event_id = context.user_data.get("event_id")
+    event = await _get_event(event_id) if event_id else None
+    if event is None:
+        context.user_data.clear()
+        await update.message.reply_text(
+            "This OT signup has closed or is no longer available. Send /start for a new OT."
+        )
+        return ConversationHandler.END
+
+    agent_id = context.user_data.get("agent_id")
+    if not agent_id:
+        context.user_data.clear()
+        await update.message.reply_text("Session expired. Send /start again.")
+        return ConversationHandler.END
+
+    agent = await _agent_by_pk(agent_id)
+    if agent is None:
+        context.user_data.clear()
+        await update.message.reply_text("Could not load your profile. Send /start again.")
+        return ConversationHandler.END
+
+    class_type = context.user_data.get("class_type")
+    day_hours = context.user_data.get("day_hours") or {}
+    if not class_type or not day_hours:
+        context.user_data.clear()
+        await update.message.reply_text("Signup data incomplete. Send /start again.")
+        return ConversationHandler.END
+
+    saved = []
+    blocked_other_open = False
+    event_full = False
+
+    for day, hours in _sorted_day_hours(day_hours):
+        already = await _already_signed_up_day(agent, event, day)
+        if already:
+            continue
+        _, status = await _create_signup(
+            agent=agent,
+            event=event,
+            day=day,
+            hours=hours,
+            class_type=class_type,
+        )
+        if status == "created":
+            saved.append((day, hours))
+        elif status == "other_open_event":
+            blocked_other_open = True
+            break
+        elif status == "full":
+            event_full = True
+            break
+        elif status in ("gone", "closed"):
+            context.user_data.clear()
+            await update.message.reply_text(
+                "This OT event is no longer available. Send /start again."
+            )
+            return ConversationHandler.END
+
+    if not saved:
+        context.user_data.clear()
+        if blocked_other_open:
+            await update.message.reply_text(
+                "You already have an active OT signup in another open event. You cannot sign up for more than one OT at the same time.",
+            )
+        elif event_full:
+            await update.message.reply_text(
+                f"The OT signup for *{_esc(event.title)}* is currently full.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await update.message.reply_text("You were already signed up for all selected days.")
+        return ConversationHandler.END
+
+    class_label = dict(CLASS_TYPES).get(class_type, "")
+    lines = [
+        "*Signed up!*",
+        f"*{_esc(event.title)}*",
+        f"Class: {_esc(class_label)}",
+        "",
+    ]
+    for day, hours in _sorted_day_hours(dict(saved)):
+        lines.append(f"  {day}: {_hours_label(day, hours)}")
+    lines += ["", "Good luck with your OT!", "Your commitment is final and cannot be cancelled."]
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+    # Capacity trigger (keeps existing behaviour).
+    from bot.handlers.admin_handlers import begin_ot_closure_with_admin_approval
+    ev2 = await _get_event_row_by_pk(event.id)
+    context.user_data.clear()
+    if ev2 and ev2.max_agents and ev2.is_full():
+        await begin_ot_closure_with_admin_approval(context.bot, ev2.id, "capacity")
+
+    return ConversationHandler.END
 
 
 async def toggle_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -865,7 +1196,10 @@ async def confirm_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Signup cancelled. Use /start to begin again.")
+    await update.message.reply_text(
+        "Signup cancelled. Use /start to begin again.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
     return ConversationHandler.END
 
 
@@ -946,51 +1280,27 @@ def build_user_conversation() -> ConversationHandler:
         ],
         states={
             PICK_EVENT: [
-                CallbackQueryHandler(
-                    select_event,
-                    pattern=r"^user_signup:[0-9a-fA-F]{8}:\d+$",
-                )
+                MessageHandler(filters.TEXT & ~filters.COMMAND, pick_event_message),
             ],
             _ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name)],
             PICK_DAYS: [
-                CallbackQueryHandler(
-                    toggle_day, pattern=r"^uday_toggle:[0-9a-fA-F]{8}:[A-Za-z]+$"
-                ),
-                CallbackQueryHandler(
-                    days_done, pattern=r"^udays_done:[0-9a-fA-F]{8}$"
-                ),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, pick_days_message),
             ],
             PICK_HOURS: [
-                CallbackQueryHandler(
-                    pick_hours, pattern=r"^uhour:[0-9a-fA-F]{8}:[0-9.]+$"
-                )
+                MessageHandler(filters.TEXT & ~filters.COMMAND, pick_hours_message),
             ],
             PICK_CLASS: [
-                CallbackQueryHandler(
-                    pick_class, pattern=r"^uclass:[0-9a-fA-F]{8}:[A-Za-z_]+$"
-                )
+                MessageHandler(filters.TEXT & ~filters.COMMAND, pick_class_message),
             ],
             CONFIRM: [
-                CallbackQueryHandler(
-                    confirm_signup,
-                    pattern=r"^uconfirm:[0-9a-fA-F]{8}:(yes|no)$",
-                )
+                MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_message),
             ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel_signup),
-            CallbackQueryHandler(
-                _outdated_signup_callback,
-                pattern=(
-                    r"^(user_signup:\d+|uday_toggle:[A-Za-z]+|udays_done$|uhour:[0-9.]+|"
-                    r"uclass:[A-Za-z_]+|uconfirm:(yes|no))$"
-                ),
-            ),
         ],
         allow_reentry=True,
         per_user=True,
         per_chat=True,
-        # per_message must stay False: with True, PTB ignores any update without callback_query,
-        # so /start and plain text entry never match this handler (see ConversationHandler.check_update).
         per_message=False,
     )
