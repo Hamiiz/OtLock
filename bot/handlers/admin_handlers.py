@@ -52,6 +52,7 @@ from bot.utils import (
     format_signup_list,
     select_event_keyboard,
     announcement_keyboard,
+    split_text_for_telegram_messages,
     _esc,
 )
 
@@ -1018,10 +1019,9 @@ async def status_ot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for event in events:
         signups = await _get_signups(event)
         list_text = format_signup_list(event, signups)
-        await update.message.reply_text(
-            f"*CURRENT STATUS (Not Closed)*\n\n{list_text}",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        full = f"*CURRENT STATUS (Not Closed)*\n\n{list_text}"
+        for part in split_text_for_telegram_messages(full):
+            await update.message.reply_text(part, parse_mode=ParseMode.MARKDOWN)
 
 
 @admin_only

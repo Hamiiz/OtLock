@@ -10,6 +10,39 @@ from django.utils import timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+# Telegram Bot API hard limit for sendMessage text.
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+
+
+def split_text_for_telegram_messages(
+    text: str, max_len: int = TELEGRAM_MAX_MESSAGE_LENGTH
+) -> list[str]:
+    """Split text into parts each under max_len characters, preferring line breaks."""
+    if len(text) <= max_len:
+        return [text]
+    chunks: list[str] = []
+    current_lines: list[str] = []
+
+    def flush() -> None:
+        nonlocal current_lines
+        if current_lines:
+            chunks.append("\n".join(current_lines))
+            current_lines = []
+
+    for line in text.split("\n"):
+        trial = "\n".join(current_lines + [line]) if current_lines else line
+        if len(trial) <= max_len:
+            current_lines.append(line)
+        else:
+            flush()
+            if len(line) <= max_len:
+                current_lines.append(line)
+            else:
+                for i in range(0, len(line), max_len):
+                    chunks.append(line[i : i + max_len])
+    flush()
+    return chunks
+
 
 def _esc(text: str) -> str:
     """Escape special Telegram MarkdownV1 characters in user-supplied strings."""
@@ -83,22 +116,43 @@ def slot_keyboard_weekend(day: str, selected: List[float]) -> InlineKeyboardMark
     return InlineKeyboardMarkup(buttons)
 
 
-def user_day_multi_keyboard(available_days: List[str], selected: List[str]) -> InlineKeyboardMarkup:
+def user_day_multi_keyboard(
+    available_days: List[str],
+    selected: List[str],
+    session_id: str,
+) -> InlineKeyboardMarkup:
     """Multi-select day keyboard for users — toggle style."""
     buttons = []
     for day in available_days:
         mark = "✅" if day in selected else "◻️"
         buttons.append(
-            [InlineKeyboardButton(f"{mark} {day}", callback_data=f"uday_toggle:{day}")]
+            [
+                InlineKeyboardButton(
+                    f"{mark} {day}",
+                    callback_data=f"uday_toggle:{session_id}:{day}",
+                )
+            ]
         )
-    buttons.append([InlineKeyboardButton("Done - Select Hours", callback_data="udays_done")])
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "Done - Select Hours",
+                callback_data=f"udays_done:{session_id}",
+            )
+        ]
+    )
     return InlineKeyboardMarkup(buttons)
 
 
-def user_hour_keyboard(day: str, slots: List[float]) -> InlineKeyboardMarkup:
+def user_hour_keyboard(day: str, slots: List[float], session_id: str) -> InlineKeyboardMarkup:
     """Hour selection keyboard for a user, based on admin-configured slots."""
     buttons = [
-        [InlineKeyboardButton(_hours_label(day, slot), callback_data=f"uhour:{slot}")]
+        [
+            InlineKeyboardButton(
+                _hours_label(day, slot),
+                callback_data=f"uhour:{session_id}:{slot}",
+            )
+        ]
         for slot in sorted(slots)
     ]
     return InlineKeyboardMarkup(buttons)
@@ -108,20 +162,23 @@ def _hours_label(day: str, hours: float) -> str:
     return f"{int(hours) if hours == int(hours) else hours} hrs"
 
 
-def class_keyboard() -> InlineKeyboardMarkup:
+def class_keyboard(session_id: str) -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(label, callback_data=f"uclass:{code}")]
+        [InlineKeyboardButton(label, callback_data=f"uclass:{session_id}:{code}")]
         for code, label in CLASS_TYPES
     ]
     return InlineKeyboardMarkup(buttons)
 
 
-def confirm_keyboard() -> InlineKeyboardMarkup:
+def confirm_keyboard(session_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Confirm - I understand I cannot cancel", callback_data="uconfirm:yes"),
-                InlineKeyboardButton("Cancel", callback_data="uconfirm:no"),
+                InlineKeyboardButton(
+                    "Confirm - I understand I cannot cancel",
+                    callback_data=f"uconfirm:{session_id}:yes",
+                ),
+                InlineKeyboardButton("Cancel", callback_data=f"uconfirm:{session_id}:no"),
             ]
         ]
     )
@@ -197,7 +254,11 @@ def format_signup_list(event, signups) -> str:
     return "\n".join(lines)
 
 
-def select_event_keyboard(events, callback_prefix: str) -> InlineKeyboardMarkup:
+def select_event_keyboard(
+    events,
+    callback_prefix: str,
+    session_id: str | None = None,
+) -> InlineKeyboardMarkup:
     """Generate a vertical list of buttons for selecting an active OT event."""
     buttons = []
     for event in events:
@@ -212,7 +273,11 @@ def select_event_keyboard(events, callback_prefix: str) -> InlineKeyboardMarkup:
         buttons.append([
             InlineKeyboardButton(
                 label,
-                callback_data=f"{callback_prefix}:{event.id}"
+                callback_data=(
+                    f"{callback_prefix}:{session_id}:{event.id}"
+                    if session_id
+                    else f"{callback_prefix}:{event.id}"
+                ),
             )
         ])
     return InlineKeyboardMarkup(buttons)

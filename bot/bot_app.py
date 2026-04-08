@@ -78,7 +78,8 @@ def get_ptb_application():
             Application.builder()
             .token(token)
             .request(request)
-            .concurrent_updates(True)
+            # Sequential updates reduce lag and race issues with ConversationHandler.
+            .concurrent_updates(False)
             .post_init(scan_overdue_deadlines_on_startup)
             .build()
         )
