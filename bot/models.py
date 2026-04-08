@@ -58,11 +58,13 @@ class OTSignup(models.Model):
     CLASS_DIALER = "DIALER"
     CLASS_IB = "IB"
     CLASS_TOPLIST = "TOPLIST"
+    CLASS_SUPERVISOR = "SUPERVISOR"
 
     CLASS_CHOICES = [
         (CLASS_DIALER, "Dialer"),
         (CLASS_IB, "IB"),
         (CLASS_TOPLIST, "Toplist"),
+        (CLASS_SUPERVISOR, "Supervisor"),
     ]
 
     agent = models.ForeignKey(Agent, on_delete=models.CASCADE, related_name="signups")

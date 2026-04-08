@@ -82,7 +82,7 @@ class Command(BaseCommand):
         )
 
         # Assign first 5 agents to open Shift 1
-        class_cycle = ["TOPLIST", "IB", "DIALER", "IB", "TOPLIST"]
+        class_cycle = ["TOPLIST", "IB", "DIALER", "SUPERVISOR", "IB", "TOPLIST"]
         for idx, agent in enumerate(agents[:5]):
             OTSignup.objects.get_or_create(
                 agent=agent,
@@ -98,7 +98,7 @@ class Command(BaseCommand):
             )
 
         # Assign next 5 agents to open Shift 2
-        class_cycle2 = ["DIALER", "IB", "TOPLIST", "DIALER", "IB"]
+        class_cycle2 = ["DIALER", "IB", "TOPLIST", "SUPERVISOR", "DIALER", "IB"]
         for idx, agent in enumerate(agents[5:]):
             OTSignup.objects.get_or_create(
                 agent=agent,

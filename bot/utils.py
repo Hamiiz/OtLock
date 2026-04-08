@@ -8,7 +8,12 @@ from typing import List
 
 from django.utils import timezone
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 # Telegram Bot API hard limit for sendMessage text.
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
@@ -64,6 +69,7 @@ CLASS_TYPES = [
     ("DIALER", "Dialer"),
     ("IB", "IB"),
     ("TOPLIST", "Toplist"),
+    ("SUPERVISOR", "Supervisor"),
 ]
 
 
@@ -184,6 +190,45 @@ def confirm_keyboard(session_id: str) -> InlineKeyboardMarkup:
     )
 
 
+def user_event_reply_keyboard(events) -> ReplyKeyboardMarkup:
+    """Reply keyboard for message-based event picking."""
+    buttons = [[KeyboardButton(f"OT {event.id}")] for event in events]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
+
+
+def user_days_reply_keyboard(available_days: list[str] | None = None) -> ReplyKeyboardMarkup:
+    """Reply keyboard for day toggling + completion."""
+    days = available_days if available_days is not None else ALL_DAYS
+    buttons = [[KeyboardButton(day)] for day in days]
+    buttons.append([KeyboardButton("Done")])
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
+
+
+def user_hours_reply_keyboard(slots: list[float]) -> ReplyKeyboardMarkup:
+    """Reply keyboard for allowed hour values (one value per tap)."""
+    def _fmt(h: float) -> str:
+        return str(int(h)) if h == int(h) else str(h)
+
+    hour_labels = [_fmt(float(s)) for s in sorted(set(slots))]
+    buttons = [[KeyboardButton(lbl)] for lbl in hour_labels]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
+
+
+def user_class_reply_keyboard() -> ReplyKeyboardMarkup:
+    """Reply keyboard for class type selection."""
+    buttons = [[KeyboardButton(label)] for _code, label in CLASS_TYPES]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
+
+
+def user_confirm_reply_keyboard() -> ReplyKeyboardMarkup:
+    """Reply keyboard for confirm/cancel."""
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("Confirm"), KeyboardButton("Cancel")]],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
 def format_announcement(event) -> str:
     """Format the OT announcement message sent to the group."""
     days_str = ", ".join(event.days) if event.days else "TBD"
@@ -283,7 +328,7 @@ def select_event_keyboard(
     return InlineKeyboardMarkup(buttons)
 
 
-CLASS_TYPE_ORDER = ["TOPLIST", "IB", "DIALER"]
+CLASS_TYPE_ORDER = ["TOPLIST", "IB", "DIALER", "SUPERVISOR"]
 
 
 def generate_csv(event, signups) -> bytes:
