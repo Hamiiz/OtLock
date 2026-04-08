@@ -129,12 +129,12 @@ def _create_signup(agent, event, day, hours, class_type):
             return None, "closed"
         # Enforce one-open-OT-per-user rule at commit time as well.
         # This closes race windows between /start and final confirmation.
-        has_other_open = OTSignup.objects.filter(
+         duplicate_day = OTSignup.objects.filter(
             agent=agent,
-            ot_event__is_open=True,
-        ).exclude(ot_event=ev).exists()
-        if has_other_open:
-            return None, "other_open_event"
+            ot_event__is_open=True
+        ).exclude(ot_event=ev).filter(day=day).exists()
+        if duplicate_day:
+            return None, "duplicate_day"
         if ev.is_full():
             return None, "full"   # caller handles the "event is full" case
         signup, created = OTSignup.objects.get_or_create(
@@ -701,6 +701,11 @@ async def confirm_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif status == "full":
             event_full = True
             break
+        elif status == "duplicate_day":
+            await update.message.reply_text(
+              "You have already signed up for this day in another open OT event. Please pick other days."
+            )
+        return ConversationHandler.END
         elif status in ("gone", "closed"):
             context.user_data.clear()
             await update.message.reply_text(
@@ -1115,6 +1120,11 @@ async def confirm_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif status == "full":
                 event_full = True
                 break
+            elif status == "duplicate_day":
+                await query.edit_message_text(
+                  "You have already signed up for this day in another open OT event. Please pick other days."
+                )
+            return ConversationHandler.END
             elif status == "gone":
                 context.user_data.clear()
                 try:
