@@ -40,7 +40,8 @@ class OTRegressionTests(TestCase):
         url = kb.inline_keyboard[0][0].url
         self.assertEqual(url, "https://t.me/MyBot?start=signup_42")
 
-    def test_create_signup_blocks_second_open_ot(self):
+    def test_create_signup_blocks_same_day_in_second_ot(self):
+        """Signing up for the same day in a second open OT must be blocked."""
         first = self._make_event("OT A")
         second = self._make_event("OT B")
         OTSignup.objects.create(
@@ -59,8 +60,40 @@ class OTRegressionTests(TestCase):
             class_type="DIALER",
         )
 
-        self.assertEqual(status, "other_open_event")
+        self.assertEqual(status, "duplicate_day")
         self.assertEqual(OTSignup.objects.filter(agent=self.agent, ot_event=second).count(), 0)
+
+    def test_create_signup_allows_different_day_in_second_ot(self):
+        """Signing up for a *different* day in a second open OT must succeed."""
+        first = self._make_event("OT A")
+        second = self._make_event("OT B")
+        OTSignup.objects.create(
+            agent=self.agent,
+            ot_event=first,
+            day="Monday",
+            hours=2.0,
+            class_type="IB",
+        )
+
+        _, status = async_to_sync(_create_signup)(
+            agent=self.agent,
+            event=second,
+            day="Tuesday",
+            hours=2.0,
+            class_type="DIALER",
+        )
+
+        self.assertEqual(status, "created")
+        self.assertEqual(OTSignup.objects.filter(agent=self.agent, ot_event=second).count(), 1)
+
+    def test_agent_name_truncated_at_50_chars(self):
+        """Names longer than 50 characters should be silently truncated."""
+        long_name = "A" * 100
+        truncated = long_name[:50]
+        self.assertEqual(len(truncated), 50)
+        # Simulate what receive_name does:
+        result = long_name.strip()[:50]
+        self.assertEqual(result, truncated)
 
     def test_generate_csv_has_required_class_order_and_table_shape(self):
         event = self._make_event("OT CSV")

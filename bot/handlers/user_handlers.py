@@ -32,6 +32,10 @@ from bot.utils import (
     user_hours_reply_keyboard,
     user_class_reply_keyboard,
     user_confirm_reply_keyboard,
+    user_day_multi_keyboard,
+    user_hour_keyboard,
+    class_keyboard,
+    confirm_keyboard,
     CLASS_TYPES,
     ALL_DAYS,
     _hours_label,
@@ -109,10 +113,22 @@ def _any_signup_for_event(agent, event):
 
 
 @sync_to_async
-def _has_signup_in_any_open_event(agent):
-    """True if agent has a signup in any currently open OT event."""
-    from bot.models import OTEvent
-    return OTSignup.objects.filter(agent=agent, ot_event__is_open=True).exists()
+def _get_days_taken_in_other_open_events(agent, event):
+    """Return a set of day names already booked in open OT events OTHER than *event*."""
+    return set(
+        OTSignup.objects.filter(agent=agent, ot_event__is_open=True)
+        .exclude(ot_event=event)
+        .values_list("day", flat=True)
+    )
+
+
+@sync_to_async
+def _get_signed_days_for_event(agent, event):
+    """Return a set of day names already booked for this specific event."""
+    return set(
+        OTSignup.objects.filter(agent=agent, ot_event=event)
+        .values_list("day", flat=True)
+    )
 
 
 @sync_to_async
@@ -228,15 +244,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except (IndexError, ValueError):
             event = None
 
-    # 2. Check for ANY signup if they are a known agent
+    # 2. Pre-load the agent (used below and passed into the signup flow)
     existing_agent = await _get_agent(update.effective_user.id)
-    if existing_agent and await _has_signup_in_any_open_event(existing_agent):
-        await update.message.reply_text(
-            "You already have an active OT signup.\n"
-            "You cannot sign up for more than one OT at the same time.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return ConversationHandler.END
 
     # 3. Handle event selection
     if not event:
@@ -323,33 +332,18 @@ async def select_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _start_signup_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, event):
-    """Internal helper to shared logic for starting the actual signup steps."""
+    """Internal helper for shared logic when starting the actual signup steps.
+
+    Agents are now allowed to sign up for multiple open OTs as long as they
+    don't pick the same *day* in more than one OT.  Days already booked in
+    another open OT are shown as 🚫 in the keyboard and cannot be selected.
+
+    Agents may also re-enter this flow for an OT they have already partially
+    signed up for in order to add more days.
+    """
     context.user_data.setdefault("wizard_session_id", _new_wizard_session_id())
 
-    # Check for existing agent
     existing_agent = await _get_agent(update.effective_user.id)
-    if existing_agent:
-        # Check if already signed up specifically for this event
-        already = await _any_signup_for_event(existing_agent, event)
-        if already:
-            msg = f"You already have signups for *{_esc(event.title)}*!\nYou cannot change or cancel your signup."
-            if update.callback_query:
-                await update.callback_query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
-            else:
-                await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-            return ConversationHandler.END
-
-        context.user_data["agent_name"] = existing_agent.agent_name
-        context.user_data["agent_id"] = existing_agent.pk
-        context.user_data["agent_known"] = True
-    else:
-        context.user_data["agent_known"] = False
-
-    context.user_data["selected_days"] = []
-    context.user_data["day_hours"] = {}   # {day: hours}
-    # Cache for hour-picker steps — avoids a DB round-trip on every day transition.
-    context.user_data["event_days"] = event.days
-    context.user_data["signup_time_slots"] = dict(event.time_slots or {})
 
     async def _send_text(text, **kwargs):
         if update.callback_query:
@@ -357,30 +351,75 @@ async def _start_signup_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
         else:
             await update.message.reply_text(text, **kwargs)
 
-    if not context.user_data["agent_known"]:
+    if existing_agent:
+        context.user_data["agent_name"] = existing_agent.agent_name
+        context.user_data["agent_id"] = existing_agent.pk
+        context.user_data["agent_known"] = True
+
+        # Days already booked in OTHER open OTs — these are off-limits for this OT.
+        disabled_days = await _get_days_taken_in_other_open_events(existing_agent, event)
+        # Days already confirmed for THIS event (so we don't re-show them as selectable).
+        already_signed_days = await _get_signed_days_for_event(existing_agent, event)
+
+        # Available = event days not yet signed for this OT; selectable = available minus blocked.
+        available_for_selection = [d for d in event.days if d not in already_signed_days]
+        selectable_days = [d for d in available_for_selection if d not in disabled_days]
+
+        if not selectable_days and not already_signed_days:
+            # Nothing usable left at all
+            msg = (
+                f"All available days in *{_esc(event.title)}* are already booked "
+                "in your other OT signups. You cannot sign up for this OT."
+            )
+            await _send_text(msg, parse_mode=ParseMode.MARKDOWN)
+            return ConversationHandler.END
+
+        context.user_data["selected_days"] = []
+        context.user_data["day_hours"] = {}
+        context.user_data["event_days"] = selectable_days
+        context.user_data["disabled_days"] = list(disabled_days)
+        context.user_data["signup_time_slots"] = dict(event.time_slots or {})
+
+        already_note = ""
+        if already_signed_days:
+            already_note = (
+                f"\n_(Already signed: {', '.join(_sorted_days(list(already_signed_days)))})_"
+            )
+        blocked_note = ""
+        if disabled_days:
+            blocked_note = (
+                f"\n_Blocked (booked in another OT): {', '.join(_sorted_days(list(disabled_days)))}_"
+            )
+
         await _send_text(
-            f"Welcome! You're signing up for *{_esc(event.title)}*.\n\n"
-            "Please enter your *agent name* exactly as it appears in your roster:",
+            f"Welcome back, *{_esc(existing_agent.agent_name)}*!\n\n"
+            f"Signing up for: *{_esc(event.title)}*{already_note}{blocked_note}\n\n"
+            "Select the days you want to work OT.\n"
+            "Tap a day to toggle it, then press Done.",
+            reply_markup=user_days_reply_keyboard(selectable_days),
             parse_mode=ParseMode.MARKDOWN,
         )
-        return _ASK_NAME
+        return PICK_DAYS
 
+    # ── New agent: ask for name first ──────────────────────────────────────
+    context.user_data["agent_known"] = False
+    context.user_data["selected_days"] = []
+    context.user_data["day_hours"] = {}
+    context.user_data["event_days"] = event.days
+    context.user_data["disabled_days"] = []
+    context.user_data["signup_time_slots"] = dict(event.time_slots or {})
     await _send_text(
-        f"Welcome back, *{_esc(existing_agent.agent_name)}*!\n\n"
-        f"Signing up for: *{_esc(event.title)}*\n\n"
-        "Select the days you want to work OT.\n"
-        "Tap a day to toggle it, then press Done.",
-        reply_markup=user_days_reply_keyboard(event.days),
+        f"Welcome! You're signing up for *{_esc(event.title)}*.\n\n"
+        "Please enter your *agent name* exactly as it appears in your roster:",
         parse_mode=ParseMode.MARKDOWN,
     )
-    return PICK_DAYS
-
+    return _ASK_NAME
 
 _ASK_NAME = 10  # Extra state only used for new agents
 
 
 async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    agent_name = update.message.text.strip()
+    agent_name = update.message.text.strip()[:50]  # silently truncate at 50 chars
     if not agent_name:
         await update.message.reply_text("Please enter a valid name.")
         return _ASK_NAME
@@ -398,8 +437,15 @@ async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     agent = await _get_or_create_agent(user.id, user.username or "", agent_name)
     context.user_data["agent_id"] = agent.pk
+    disabled_days = context.user_data.get("disabled_days") or []
+    event_days = context.user_data.get("event_days") or []
+    blocked_note = ""
+    if disabled_days:
+        blocked_note = (
+            f"\n_(Blocked in another OT: {', '.join(disabled_days)})_"
+        )
     await update.message.reply_text(
-        f"Name saved: *{_esc(agent_name)}*\n\n"
+        f"Name saved: *{_esc(agent_name)}*{blocked_note}\n\n"
         "Select the days you want to work OT.\n"
         "Tap a day to toggle it, then press Done.",
         reply_markup=user_days_reply_keyboard(event_days),
@@ -780,6 +826,7 @@ async def toggle_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     selected = context.user_data.setdefault("selected_days", [])
     event_days = context.user_data.get("event_days") or []
+    disabled_days = context.user_data.get("disabled_days") or []
     if day in selected:
         selected.remove(day)
     else:
@@ -790,6 +837,7 @@ async def toggle_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 event_days,
                 selected,
                 session_id=context.user_data["wizard_session_id"],
+                disabled_days=disabled_days,
             )
         )
     except Exception:
@@ -799,6 +847,20 @@ async def toggle_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         context.user_data.clear()
         return ConversationHandler.END
+    return PICK_DAYS
+
+
+async def day_disabled_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show an alert when the user taps a 🚫 day that is blocked by another OT."""
+    query = update.callback_query
+    try:
+        _prefix, _session_id, day = query.data.split(":", 2)
+    except ValueError:
+        day = "this day"
+    await query.answer(
+        f"⛔ {day} is already booked in another OT. Pick a different day.",
+        show_alert=True,
+    )
     return PICK_DAYS
 
 
@@ -1294,20 +1356,28 @@ def build_user_conversation() -> ConversationHandler:
             ],
             _ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name)],
             PICK_DAYS: [
+                # Disabled-day alert must come before the generic toggle handler.
+                CallbackQueryHandler(day_disabled_alert, pattern=r"^uday_disabled:"),
+                CallbackQueryHandler(toggle_day, pattern=r"^uday_toggle:"),
+                CallbackQueryHandler(days_done, pattern=r"^udays_done:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, pick_days_message),
             ],
             PICK_HOURS: [
+                CallbackQueryHandler(pick_hours, pattern=r"^uhour:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, pick_hours_message),
             ],
             PICK_CLASS: [
+                CallbackQueryHandler(pick_class, pattern=r"^uclass:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, pick_class_message),
             ],
             CONFIRM: [
+                CallbackQueryHandler(confirm_signup, pattern=r"^uconfirm:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_message),
             ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel_signup),
+            CallbackQueryHandler(_outdated_signup_callback),
         ],
         allow_reentry=True,
         per_user=True,
