@@ -1026,42 +1026,79 @@ async def status_ot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def remove_ot_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 1: Show a list of unique agents who have signups in the active event."""
+    """Step 1: If multiple OTs are open, let admin pick which one to remove from."""
     events = await _get_open_events()
     if not events:
         await update.message.reply_text("There are no open OT events right now.")
         return
 
-    event = events[0]
-    signups = await _get_signups(event)
-
-    if not signups:
-        await update.message.reply_text(
-            f"Nobody has signed up for *{_esc(event.title)}* yet.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+    if len(events) == 1:
+        # Only one OT — go straight to agent list
+        await _show_remove_agent_list(update.message, events[0])
         return
 
+    # Multiple OTs — show picker
+    keyboard = select_event_keyboard(events, "rm_event")
+    await update.message.reply_text(
+        "Select the OT you want to remove an agent from:",
+        reply_markup=keyboard,
+    )
+
+
+async def remove_select_event_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback: admin picked which OT to remove from."""
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        await query.answer("Not authorised.", show_alert=True)
+        return
+
+    try:
+        event_id = int(query.data.split(":")[1])
+    except (IndexError, ValueError):
+        await query.edit_message_text("Invalid selection.")
+        return
+
+    event = await _get_event(event_id)
+    if not event or not event.is_open:
+        await query.edit_message_text("That OT is no longer open.")
+        return
+
+    await _show_remove_agent_list(query, event)
+
+
+async def _show_remove_agent_list(query_or_msg, event):
+    """Render the inline agent-selection keyboard for a given OT event."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-    # Deduplicate: one button per unique agent
+    signups = await _get_signups(event)
+    if not signups:
+        text = f"Nobody has signed up for *{_esc(event.title)}* yet."
+        if hasattr(query_or_msg, "edit_message_text"):
+            await query_or_msg.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await query_or_msg.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        return
+
     seen_agents = {}
     for signup in signups:
-        agent_id = signup.agent.id
-        if agent_id not in seen_agents:
-            seen_agents[agent_id] = signup.agent.agent_name
+        aid = signup.agent.id
+        if aid not in seen_agents:
+            seen_agents[aid] = signup.agent.agent_name
 
     buttons = [
-        [InlineKeyboardButton(name, callback_data=f"rm_agent:{agent_id}:{event.id}")]
-        for agent_id, name in seen_agents.items()
+        [InlineKeyboardButton(name, callback_data=f"rm_agent:{aid}:{event.id}")]
+        for aid, name in seen_agents.items()
     ]
     buttons.append([InlineKeyboardButton("Cancel", callback_data="rm_agent:cancel")])
 
-    await update.message.reply_text(
-        f"*Remove from: {_esc(event.title)}*\n\nSelect the agent to remove:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    kb = InlineKeyboardMarkup(buttons)
+    text = f"*Remove from: {_esc(event.title)}*\n\nSelect the agent to remove:"
+    if hasattr(query_or_msg, "edit_message_text"):
+        await query_or_msg.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+    else:
+        await query_or_msg.reply_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 
 
 async def remove_agent_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1180,31 +1217,7 @@ async def remove_back_to_agents(update: Update, context: ContextTypes.DEFAULT_TY
 
     event_id = int(query.data.split(":")[1])
     event = await _get_event(event_id)
-    signups = await _get_signups(event)
-
-    if not signups:
-        await query.edit_message_text("No signups remaining.")
-        return
-
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
-    seen_agents = {}
-    for signup in signups:
-        aid = signup.agent.id
-        if aid not in seen_agents:
-            seen_agents[aid] = signup.agent.agent_name
-
-    buttons = [
-        [InlineKeyboardButton(name, callback_data=f"rm_agent:{aid}:{event_id}")]
-        for aid, name in seen_agents.items()
-    ]
-    buttons.append([InlineKeyboardButton("Cancel", callback_data="rm_agent:cancel")])
-
-    await query.edit_message_text(
-        f"*Remove from: {_esc(event.title)}*\n\nSelect the agent to remove:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await _show_remove_agent_list(query, event)
 
 
 

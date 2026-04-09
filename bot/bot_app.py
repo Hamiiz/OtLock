@@ -14,6 +14,7 @@ from bot.handlers.admin_handlers import (
     scan_overdue_deadlines_on_startup,
     status_ot,
     remove_ot_start,
+    remove_select_event_callback,
     remove_agent_selected,
     remove_day_callback,
     remove_back_to_agents,
@@ -104,6 +105,7 @@ def get_ptb_application():
         app.add_handler(CommandHandler("listadmins", list_admins, filters=filters.ChatType.PRIVATE))
 
         # Inline button callbacks that live outside a conversation
+        app.add_handler(CallbackQueryHandler(remove_select_event_callback, pattern=r"^rm_event:"))
         app.add_handler(CallbackQueryHandler(remove_agent_selected, pattern=r"^rm_agent:"))
         app.add_handler(CallbackQueryHandler(remove_day_callback, pattern=r"^rm_day:"))
         app.add_handler(CallbackQueryHandler(remove_back_to_agents, pattern=r"^rm_agent_back:"))

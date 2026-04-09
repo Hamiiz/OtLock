@@ -126,19 +126,35 @@ def user_day_multi_keyboard(
     available_days: List[str],
     selected: List[str],
     session_id: str,
+    disabled_days: List[str] | None = None,
 ) -> InlineKeyboardMarkup:
-    """Multi-select day keyboard for users — toggle style."""
+    """Multi-select day keyboard for users — toggle style.
+
+    Days in *disabled_days* are rendered with 🚫 and use callback_data
+    ``uday_disabled:<session_id>:<day>`` so the bot can show an alert toast.
+    """
+    disabled_set = set(disabled_days or [])
     buttons = []
     for day in available_days:
-        mark = "✅" if day in selected else "◻️"
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    f"{mark} {day}",
-                    callback_data=f"uday_toggle:{session_id}:{day}",
-                )
-            ]
-        )
+        if day in disabled_set:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"🚫 {day}",
+                        callback_data=f"uday_disabled:{session_id}:{day}",
+                    )
+                ]
+            )
+        else:
+            mark = "✅" if day in selected else "◻️"
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"{mark} {day}",
+                        callback_data=f"uday_toggle:{session_id}:{day}",
+                    )
+                ]
+            )
     buttons.append(
         [
             InlineKeyboardButton(
@@ -379,7 +395,10 @@ def generate_csv(event, signups) -> bytes:
             per_day = agents[agent_name]
             for day in days:
                 hrs = per_day.get(day)
-                row.append(hrs if hrs is not None else "")
+                if hrs is not None:
+                    row.append(_hours_label(day, hrs))
+                else:
+                    row.append("")
             writer.writerow(row)
 
     return buf.getvalue().encode("utf-8")
