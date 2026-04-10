@@ -492,13 +492,14 @@ def _parse_class_from_text(text: str) -> str | None:
 async def pick_event_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Message-based OT selection (no inline callbacks)."""
     text = update.message.text or ""
-    # Expected: "OT <id>"
-    parts = text.strip().split()
-    if len(parts) < 2:
+    # Expected: "OT <id> | <title>" or just "OT <id>"
+    import re
+    match = re.search(r"^OT\s+(\d+)", text.strip(), re.IGNORECASE)
+    if not match:
         await update.message.reply_text("Select an OT using the buttons above.")
         return PICK_EVENT
     try:
-        eid = int(parts[-1])
+        eid = int(match.group(1))
     except ValueError:
         await update.message.reply_text("Invalid OT selection. Try again.")
         return PICK_EVENT
