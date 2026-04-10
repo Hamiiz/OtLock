@@ -208,7 +208,12 @@ def confirm_keyboard(session_id: str) -> InlineKeyboardMarkup:
 
 def user_event_reply_keyboard(events) -> ReplyKeyboardMarkup:
     """Reply keyboard for message-based event picking."""
-    buttons = [[KeyboardButton(f"OT {event.id}")] for event in events]
+    buttons = []
+    for event in events:
+        label = f"OT {event.id} | {event.title}"
+        if len(label) > 64:
+            label = label[:61] + "..."
+        buttons.append([KeyboardButton(label)])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
 
 
