@@ -17,6 +17,12 @@ class OTEvent(models.Model):
     # Maximum number of agents allowed to sign up (null = unlimited)
     max_agents = models.PositiveIntegerField(null=True, blank=True)
     is_open = models.BooleanField(default=True)
+    # Days that are closed to new signups (but existing signups are kept)
+    disabled_days = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Day names currently closed to new signups (e.g. ['Monday']). Existing signups for these days are preserved.",
+    )
     deadline = models.DateTimeField(
         null=True, blank=True,
         help_text="Auto-close after this UTC datetime (null = no deadline)"

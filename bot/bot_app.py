@@ -27,6 +27,11 @@ from bot.handlers.admin_handlers import (
     remove_admin_callback,
     list_admins,
     editot_start,
+    disableday_start,
+    disableday_select_event_callback,
+    disableday_toggle_callback,
+    disableday_done_callback,
+    disableday_cancel_callback,
 )
 from bot.handlers.user_handlers import build_user_conversation, my_ot, _outdated_signup_callback
 
@@ -103,6 +108,7 @@ def get_ptb_application():
         app.add_handler(CommandHandler("addadmin", add_admin_cmd, filters=filters.ChatType.PRIVATE))
         app.add_handler(CommandHandler("removeadmin", remove_admin_start, filters=filters.ChatType.PRIVATE))
         app.add_handler(CommandHandler("listadmins", list_admins, filters=filters.ChatType.PRIVATE))
+        app.add_handler(CommandHandler("disableday", disableday_start, filters=filters.ChatType.PRIVATE))
 
         # Inline button callbacks that live outside a conversation
         app.add_handler(CallbackQueryHandler(remove_select_event_callback, pattern=r"^rm_event:"))
@@ -117,6 +123,10 @@ def get_ptb_application():
         app.add_handler(CallbackQueryHandler(close_signup_confirm_callback, pattern=r"^close_abort$"))
         app.add_handler(CallbackQueryHandler(approve_closure_callback, pattern=r"^approve_closure:"))
         app.add_handler(CallbackQueryHandler(skip_closure_callback, pattern=r"^skip_closure:"))
+        app.add_handler(CallbackQueryHandler(disableday_select_event_callback, pattern=r"^disableday_event:"))
+        app.add_handler(CallbackQueryHandler(disableday_toggle_callback, pattern=r"^disableday_toggle:"))
+        app.add_handler(CallbackQueryHandler(disableday_done_callback, pattern=r"^disableday_done:"))
+        app.add_handler(CallbackQueryHandler(disableday_cancel_callback, pattern=r"^disableday_cancel$"))
 
         # User inline callbacks from old keyboards (day/hour selection). We don't use them anymore,
         # but answering them prevents the Telegram loading spinner.

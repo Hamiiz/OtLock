@@ -1409,6 +1409,168 @@ async def cancel_newot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ── /disableday command ───────────────────────────────────────────────────────
+
+@sync_to_async
+def _set_disabled_days(event_id: int, disabled_days: list) -> None:
+    """Persist the disabled_days list for a single OT event."""
+    OTEvent.objects.filter(pk=event_id).update(disabled_days=disabled_days)
+
+
+def _disableday_keyboard(event, pending_disabled: list) -> InlineKeyboardMarkup:
+    """Build a toggle keyboard: ✅ = open, 🔒 = signups disabled."""
+    disabled_set = set(pending_disabled)
+    buttons = []
+    for day in event.days:
+        icon = "🔒" if day in disabled_set else "✅"
+        buttons.append([
+            InlineKeyboardButton(
+                f"{icon} {day}",
+                callback_data=f"disableday_toggle:{event.id}:{day}",
+            )
+        ])
+    buttons.append([
+        InlineKeyboardButton("✔️ Done", callback_data=f"disableday_done:{event.id}"),
+        InlineKeyboardButton("Cancel", callback_data="disableday_cancel"),
+    ])
+    return InlineKeyboardMarkup(buttons)
+
+
+@admin_only
+async def disableday_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin runs /disableday — show event picker or go straight to day toggle."""
+    await _ensure_admins_loaded()
+    events = await _get_open_events()
+    if not events:
+        await update.message.reply_text("There are no open OT events right now.")
+        return
+
+    if len(events) == 1:
+        event = events[0]
+        context.user_data["disableday_pending"] = list(event.disabled_days or [])
+        await update.message.reply_text(
+            f"Toggle days for *{_esc(event.title)}*:\n"
+            "✅ = open to signups  |  🔒 = signups disabled",
+            reply_markup=_disableday_keyboard(event, context.user_data["disableday_pending"]),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # Multiple OT events — show picker first
+    keyboard = select_event_keyboard(events, "disableday_event")
+    await update.message.reply_text(
+        "Select the OT event to manage days for:",
+        reply_markup=keyboard,
+    )
+
+
+async def disableday_select_event_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin picked an event from the multi-OT picker for /disableday."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.answer("Not authorised.", show_alert=True)
+        return
+
+    try:
+        event_id = int(query.data.split(":")[1])
+    except (IndexError, ValueError):
+        await query.edit_message_text("Invalid selection.")
+        return
+
+    event = await _get_event(event_id)
+    if not event or not event.is_open:
+        await query.edit_message_text("That OT event is no longer open.")
+        return
+
+    context.user_data["disableday_pending"] = list(event.disabled_days or [])
+    await query.edit_message_text(
+        f"Toggle days for *{_esc(event.title)}*:\n"
+        "✅ = open to signups  |  🔒 = signups disabled",
+        reply_markup=_disableday_keyboard(event, context.user_data["disableday_pending"]),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def disableday_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle a single day's disabled state (in-memory, not yet saved)."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.answer("Not authorised.", show_alert=True)
+        return
+
+    try:
+        _prefix, event_id_str, day = query.data.split(":", 2)
+        event_id = int(event_id_str)
+    except (ValueError, TypeError):
+        await query.answer("Invalid data.", show_alert=True)
+        return
+
+    event = await _get_event(event_id)
+    if not event or not event.is_open:
+        await query.edit_message_text("This OT event is no longer open.")
+        return
+
+    pending = context.user_data.setdefault("disableday_pending", list(event.disabled_days or []))
+    if day in pending:
+        pending.remove(day)
+    else:
+        pending.append(day)
+
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=_disableday_keyboard(event, pending)
+        )
+    except Exception:
+        pass  # No-op if keyboard is identical
+
+
+async def disableday_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Save the toggled disabled_days to the DB and confirm."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.answer("Not authorised.", show_alert=True)
+        return
+
+    try:
+        event_id = int(query.data.split(":")[1])
+    except (IndexError, ValueError):
+        await query.edit_message_text("Invalid selection.")
+        return
+
+    event = await _get_event(event_id)
+    if not event or not event.is_open:
+        await query.edit_message_text("This OT event is no longer open.")
+        return
+
+    pending = context.user_data.pop("disableday_pending", [])
+    await _set_disabled_days(event_id, pending)
+
+    open_days = [d for d in event.days if d not in pending]
+    locked_days = [d for d in event.days if d in pending]
+
+    parts = []
+    if open_days:
+        parts.append("✅ *Open:* " + ", ".join(open_days))
+    if locked_days:
+        parts.append("🔒 *Disabled:* " + ", ".join(locked_days))
+
+    await query.edit_message_text(
+        f"*{_esc(event.title)}* — day status updated:\n\n" + "\n".join(parts),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def disableday_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel without saving."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("disableday_pending", None)
+    await query.edit_message_text("Cancelled. No changes were saved.")
+
+
 # ── ConversationHandler factory ───────────────────────────────────────────────
 
 def build_admin_conversation() -> ConversationHandler:
