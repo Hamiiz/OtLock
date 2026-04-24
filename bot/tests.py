@@ -113,9 +113,41 @@ class OTRegressionTests(TestCase):
         self.assertTrue(toplist_idx < ib_idx < dialer_idx)
 
         self.assertIn("Agent Name,Monday,Tuesday", lines)
-        self.assertIn("Agent One,2.0,", lines)
-        self.assertIn("Agent Two,,4.0", lines)
-        self.assertIn("Agent Three,2.0,", lines)
+        self.assertIn("Agent One,2 hrs,", lines)
+        self.assertIn("Agent Two,,4 hrs", lines)
+        self.assertIn("Agent Three,2 hrs,", lines)
+
+    def test_disabled_day_blocks_new_signup(self):
+        """If an admin disabled a day, new signups for it should be blocked server-side."""
+        event = self._make_event("Blocked Day OT")
+        event.disabled_days = ["Monday"]
+        event.save()
+
+        _, status = async_to_sync(_create_signup)(
+            agent=self.agent,
+            event=event,
+            day="Monday",
+            hours=2.0,
+            class_type="DIALER",
+        )
+        self.assertEqual(status, "day_disabled")
+        self.assertEqual(OTSignup.objects.filter(agent=self.agent, ot_event=event).count(), 0)
+
+    def test_disabled_day_does_not_affect_other_days(self):
+        """If an admin disabled a day, signups for OTHER days remain fully open."""
+        event = self._make_event("Blocked Day OT")
+        event.disabled_days = ["Monday"]
+        event.save()
+
+        _, status = async_to_sync(_create_signup)(
+            agent=self.agent,
+            event=event,
+            day="Tuesday",
+            hours=2.0,
+            class_type="DIALER",
+        )
+        self.assertEqual(status, "created")
+        self.assertEqual(OTSignup.objects.filter(agent=self.agent, ot_event=event).count(), 1)
 
     def test_split_text_for_telegram_messages_respects_limit(self):
         parts = split_text_for_telegram_messages("a\n" * 3000, max_len=100)

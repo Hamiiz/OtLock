@@ -144,6 +144,9 @@ def _create_signup(agent, event, day, hours, class_type):
             return None, "gone"
         if not ev.is_open:
             return None, "closed"
+        # Server-side guard: reject signups for admin-disabled days.
+        if day in (ev.disabled_days or []):
+            return None, "day_disabled"
         # Enforce one-open-OT-per-user rule at commit time as well.
         # This closes race windows between /start and final confirmation.
         duplicate_day = OTSignup.objects.filter(
@@ -358,7 +361,10 @@ async def _start_signup_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
         context.user_data["agent_known"] = True
 
         # Days already booked in OTHER open OTs — these are off-limits for this OT.
-        disabled_days = await _get_days_taken_in_other_open_events(existing_agent, event)
+        other_ot_disabled = await _get_days_taken_in_other_open_events(existing_agent, event)
+        # Days admin has explicitly disabled for this event.
+        admin_disabled = set(event.disabled_days or [])
+        disabled_days = other_ot_disabled | admin_disabled
         # Days already confirmed for THIS event (so we don't re-show them as selectable).
         already_signed_days = await _get_signed_days_for_event(existing_agent, event)
 
@@ -370,7 +376,7 @@ async def _start_signup_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
             # Nothing usable left at all
             msg = (
                 f"All available days in *{_esc(event.title)}* are already booked "
-                "in your other OT signups. You cannot sign up for this OT."
+                "or currently closed. You cannot sign up for this OT."
             )
             await _send_text(msg, parse_mode=ParseMode.MARKDOWN)
             return ConversationHandler.END
@@ -387,9 +393,13 @@ async def _start_signup_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 f"\n_(Already signed: {', '.join(_sorted_days(list(already_signed_days)))})_"
             )
         blocked_note = ""
-        if disabled_days:
-            blocked_note = (
-                f"\n_Blocked (booked in another OT): {', '.join(_sorted_days(list(disabled_days)))}_"
+        if other_ot_disabled:
+            blocked_note += (
+                f"\n_Blocked (booked in another OT): {', '.join(_sorted_days(list(other_ot_disabled)))}_"
+            )
+        if admin_disabled:
+            blocked_note += (
+                f"\n_Closed by admin: {', '.join(_sorted_days(list(admin_disabled)))}_"
             )
 
         await _send_text(
@@ -403,12 +413,24 @@ async def _start_signup_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return PICK_DAYS
 
     # ── New agent: ask for name first ──────────────────────────────────────
+    admin_disabled = set(event.disabled_days or [])
+    # For new agents the cross-OT conflict set is empty (no prior signups yet).
+    selectable_days = [d for d in event.days if d not in admin_disabled]
     context.user_data["agent_known"] = False
     context.user_data["selected_days"] = []
     context.user_data["day_hours"] = {}
-    context.user_data["event_days"] = event.days
-    context.user_data["disabled_days"] = []
+    context.user_data["event_days"] = selectable_days
+    context.user_data["disabled_days"] = list(admin_disabled)
     context.user_data["signup_time_slots"] = dict(event.time_slots or {})
+
+    if not selectable_days:
+        await _send_text(
+            f"All days for *{_esc(event.title)}* are currently closed by the admin.\n"
+            "Please check back later or contact an admin.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ConversationHandler.END
+
     await _send_text(
         f"Welcome! You're signing up for *{_esc(event.title)}*.\n\n"
         "Please enter your *agent name* exactly as it appears in your roster:",
@@ -764,6 +786,13 @@ async def confirm_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif status == "duplicate_day":
             await update.message.reply_text(
               "You have already signed up for this day in another open OT event. Please pick other days."
+            )
+            return ConversationHandler.END
+        elif status == "day_disabled":
+            await update.message.reply_text(
+                f"Signups for *{day}* have been closed by an admin. "
+                "Send /start to see which days are still available.",
+                parse_mode=ParseMode.MARKDOWN,
             )
             return ConversationHandler.END
         elif status in ("gone", "closed"):
