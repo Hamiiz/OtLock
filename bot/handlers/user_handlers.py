@@ -10,6 +10,7 @@ Flow:
 """
 from __future__ import annotations
 
+import re
 import secrets
 
 from asgiref.sync import sync_to_async
@@ -422,6 +423,18 @@ async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     agent_name = update.message.text.strip()[:50]  # silently truncate at 50 chars
     if not agent_name:
         await update.message.reply_text("Please enter a valid name.")
+        return _ASK_NAME
+
+    # Reject stale OT-picker button presses (e.g. "OT 5 | Night OT shift").
+    # This happens when Telegram's persistent reply keyboard still shows the
+    # event-selection buttons from a previous step and the user taps one while
+    # the bot is waiting for their agent name.
+    if re.match(r"^OT\s+\d+", agent_name, re.IGNORECASE):
+        await update.message.reply_text(
+            "That looks like an OT selection, not a name. "
+            "Please type your *agent name* exactly as it appears in the roster:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return _ASK_NAME
 
     event_days = context.user_data.get("event_days")
